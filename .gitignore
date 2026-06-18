@@ -1,0 +1,12 @@
+*.fits
+*.txt
+*.axy
+*.xyls
+*.match
+*.rdls
+*.solved
+*.png
+*.corr
+*.new
+/Data
+/output
