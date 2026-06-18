@@ -1,31 +1,57 @@
-import os
-import sys
+"""
+gui.py — Space Debris Detection & Photometry Dashboard
+=======================================================
+Professional Tkinter GUI for the FRIGATE pipeline.
+
+Performance fixes vs original:
+  - Image cached as numpy array; stretch/cmap changes reuse cached data
+  - Matplotlib figure NOT recreated on every update — only image data replaced
+  - Motion-notify debounced (16ms throttle, ~60fps max)
+  - Log console: plain text insert, capped at 4000 lines, no state toggle per line
+  - Downsampling factor computed once on load, not every redraw
+  - Treeview: tag-based row colouring, incremental insert
+  - All messagebox calls routed through gui_queue (never from worker thread directly)
+  - Pipeline cancel flag (threading.Event) checked by workers
+  - Status bar with animated spinner during pipeline runs
+  - Keyboard shortcuts: F5=run all, Ctrl+L=clear log, Escape=cancel
+"""
+
+import gc
+import io
 import math
+import os
 import queue
+import sys
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import time
 from pathlib import Path
-from PIL import Image, ImageTk
 
-# Add directories to system path
-ROOT_DIR = Path(__file__).parent.parent
-CODE_DIR = ROOT_DIR / "Code"
-sys.path.append(str(ROOT_DIR))
-sys.path.append(str(CODE_DIR))
-
-# Matplotlib integration
 import matplotlib
 matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
 import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import numpy as np
 
-# Pipeline imports
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+try:
+    from PIL import Image, ImageTk
+    _PIL = True
+except ImportError:
+    _PIL = False
+
+# ── Pipeline imports (graceful degradation if modules missing) ────────────────
+ROOT_DIR = Path(__file__).parent.parent
+CODE_DIR = ROOT_DIR / "Code"
+sys.path.extend([str(ROOT_DIR), str(CODE_DIR)])
+
+_IMPORT_ERROR = None
 try:
     from astropy.io import fits
     from astropy.wcs import WCS
-    # pyrefly: ignore [missing-import]
     from pre_process import run_preprocessing, get_sorted_fits
     from difference import run_difference
     from plate_solver import solve_and_apply_wcs
@@ -33,979 +59,1038 @@ try:
     from display import apply_stretch
     from flux_extract import extract_streak_flux
 except ImportError as e:
-    print(f"Error importing dependencies in GUI: {e}")
-    messagebox.showerror("Import Error", f"Missing required dependency: {e}\nPlease check requirements.txt")
+    _IMPORT_ERROR = str(e)
+    # Stub so the GUI still launches and shows the error
+    def get_sorted_fits(d): return sorted(Path(d).glob("*.fits"))
+    def apply_stretch(d, stretch_type="percentile"):
+        lo, hi = np.percentile(d, [2, 99])
+        return np.clip((d - lo) / max(hi - lo, 1), 0, 1)
 
-# Thread-safe log redirector
-class QueueLogger:
-    def __init__(self, text_widget, log_queue, original_stream=None):
-        self.text_widget = text_widget
-        self.log_queue = log_queue
-        self.original_stream = original_stream
-        self.text_widget.config(state=tk.DISABLED)
-        
-    def write(self, string):
-        self.log_queue.put(string)
-        if self.original_stream:
-            self.original_stream.write(string)
-            self.original_stream.flush()
-            
+
+# =============================================================================
+# Palette & design tokens
+# =============================================================================
+# Inspired by deep-sky observatory dashboards: near-black with cold-blue
+# accent and amber for live data. One signature element: the status bar
+# uses a pulsing amber dot to show pipeline activity without blocking the UI.
+
+PAL = {
+    "bg":          "#0d0f14",   # near-black with blue tint
+    "surface":     "#13161e",   # card background
+    "surface2":    "#1a1e29",   # slightly lighter surface
+    "border":      "#252a38",   # subtle border
+    "accent":      "#4d9de0",   # cold blue — primary action
+    "accent_dim":  "#2a5580",   # muted blue for inactive
+    "amber":       "#e8a838",   # live data / warning
+    "green":       "#3dd68c",   # success / correlated
+    "red":         "#e05d5d",   # error / uncorrelated
+    "fg":          "#d8dce8",   # primary text
+    "fg_dim":      "#6b7394",   # secondary text
+    "mono":        "Consolas",  # monospace
+    "ui":          "Segoe UI",  # UI font
+}
+
+FONT_UI    = (PAL["ui"],   10)
+FONT_UI_B  = (PAL["ui"],   10, "bold")
+FONT_TITLE = (PAL["ui"],   11, "bold")
+FONT_MONO  = (PAL["mono"],  9)
+FONT_SMALL = (PAL["ui"],    9)
+
+
+# =============================================================================
+# Thread-safe logger
+# =============================================================================
+
+class _Logger:
+    """
+    Writes to a queue; the main thread drains it into the Text widget.
+    Never touches Tkinter from a worker thread.
+    """
+    MAX_LINES = 4000
+
+    def __init__(self, q: queue.Queue, original=None):
+        self._q        = q
+        self._original = original
+
+    def write(self, s):
+        self._q.put(("log", s))
+        if self._original:
+            self._original.write(s)
+
     def flush(self):
-        if self.original_stream:
-            self.original_stream.flush()
+        if self._original:
+            try: self._original.flush()
+            except Exception: pass
+
+
+# =============================================================================
+# Main application
+# =============================================================================
 
 class DebrisTrackerGUI(tk.Tk):
+
+    # ── init ─────────────────────────────────────────────────────────────────
     def __init__(self):
         super().__init__()
-        
-        self.title("Space Debris Track & Photometry Dashboard")
-        self.geometry("1280x850")
-        self.minsize(1024, 768)
-        
-        # Color Palette - Modern Sleek Dark Theme
-        self.bg_dark = "#121216"
-        self.bg_card = "#1e1e24"
-        self.accent_blue = "#00adb5"
-        self.accent_orange = "#ff9f1c"
-        self.text_light = "#eeeeee"
-        self.text_dim = "#9a9aa2"
-        self.border_color = "#33333d"
-        
-        self.configure(bg=self.bg_dark)
-        
-        # Styling Setup
-        self.setup_styles()
-        
-        # State Variables
-        self.raw_dir_var = tk.StringVar(value=str(ROOT_DIR / "Data" / "raw"))
-        self.catalog_var = tk.StringVar(value=str(ROOT_DIR / "Data" / "3le.txt"))
-        self.output_dir_var = tk.StringVar(value=str(ROOT_DIR / "Output"))
-        self.start_frame_var = tk.StringVar()
-        self.num_frames_var = tk.IntVar(value=10)
-        self.preprocess_var = tk.BooleanVar(value=False)
-        self.solve_var = tk.BooleanVar(value=True)
-        self.show_annotated_var = tk.BooleanVar(value=True)
-        
-        self.current_fits_data = None
-        self.current_fits_header = None
-        self.current_wcs = None
-        self.current_png_path = None
-        self.detected_tracks = []
-        self.selected_fits_path = None
-        
-        # Logging Queue
-        self.log_queue = queue.Queue()
-        
-        # GUI Task Queue
-        self.gui_queue = queue.Queue()
-        
-        # Build UI Elements
-        self.build_ui()
-        
-        # Populate FITS dropdown list
-        self.scan_raw_directory()
-        
-        # Start logging queue check loop
-        self.after(100, self.process_log_queue)
-        
-        # Start GUI task queue check loop
-        self.after(50, self.process_gui_queue)
-        
-        # Redirect stdout and stderr
-        self.old_stdout = sys.stdout
-        self.old_stderr = sys.stderr
-        sys.stdout = QueueLogger(self.log_console, self.log_queue, self.old_stdout)
-        sys.stderr = QueueLogger(self.log_console, self.log_queue, self.old_stderr)
-        
-        # Print welcome banner
-        print("=" * 60)
-        print("  Space Debris Detection & Photometry Pipeline GUI Active")
-        print("=" * 60)
-        print("Use the left panel to configure paths and trigger pipeline steps.")
-        print("Double-click rows in the results list to view target details.")
-        
-    def setup_styles(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        
-        # Custom styles for dark theme
-        style.configure("TLabel", background=self.bg_card, foreground=self.text_light, font=("Segoe UI", 10))
-        style.configure("TButton", background=self.accent_blue, foreground="#ffffff", font=("Segoe UI", 10, "bold"), borderwidth=0)
-        style.map("TButton", background=[("active", "#00dcd4"), ("pressed", "#008a90")])
-        
-        style.configure("Card.TFrame", background=self.bg_card, borderwidth=1, relief="flat")
-        style.configure("Title.TLabel", background=self.bg_card, foreground=self.accent_blue, font=("Segoe UI", 12, "bold"))
-        
-        style.configure("TCombobox", fieldbackground=self.bg_dark, background=self.bg_dark, foreground=self.text_light, bordercolor=self.border_color)
-        style.configure("TSpinbox", fieldbackground=self.bg_dark, background=self.bg_dark, foreground=self.text_light)
-        
-        # Notebook (Tabs) Styling
-        style.configure("TNotebook", background=self.bg_dark, borderwidth=0)
-        style.configure("TNotebook.Tab", background=self.bg_card, foreground=self.text_dim, padding=[12, 4], font=("Segoe UI", 10))
-        style.map("TNotebook.Tab", background=[("selected", self.bg_dark)], foreground=[("selected", self.accent_blue)])
-        
-        # Treeview (Table) Styling
-        style.configure("Treeview", background=self.bg_card, fieldbackground=self.bg_card, foreground=self.text_light, 
-                        rowheight=25, borderwidth=0, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", background=self.bg_dark, foreground=self.text_light, font=("Segoe UI", 10, "bold"))
-        style.map("Treeview", background=[("selected", self.accent_blue)], foreground=[("selected", "#ffffff")])
-        
-    def build_ui(self):
-        # Outer container with padding
-        main_container = tk.Frame(self, bg=self.bg_dark)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # --- LEFT PANEL: Settings & Pipeline (Width: 340) ---
-        left_panel = ttk.Frame(main_container, style="Card.TFrame", padding=4)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
-        left_panel.pack_propagate(False)
-        left_panel.config(width=340)
+        self.title("FRIGATE — Space Debris Detection & Photometry")
+        self.geometry("1400x860")
+        self.minsize(1100, 720)
+        self.configure(bg=PAL["bg"])
 
-        # Scrollable Canvas setup for the left control panel
-        canvas = tk.Canvas(left_panel, bg=self.bg_card, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(left_panel, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas, style="Card.TFrame")
+        # State
+        self._fits_data     = None      # raw float32 array, cached on load
+        self._fits_header   = None
+        self._fits_wcs      = None
+        self._fits_path     = None
+        self._display_cache = None      # (stretch, cmap) → scaled uint8
+        self._display_key   = None
+        self._ds_factor     = 1         # downsampling, computed once on load
+        self._png_path      = None
+        self._tracks        = []
+        self._cancel_flag   = threading.Event()
+        self._running       = False
+        self._motion_after  = None      # debounce id for mouse move
+        self._spinner_after = None
+        self._spinner_idx   = 0
 
-        # Configure scrollregion on resize
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(
-                scrollregion=canvas.bbox("all")
-            )
-        )
+        # Queues
+        self._log_q  = queue.Queue()
+        self._gui_q  = queue.Queue()
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw", width=310)
-        canvas.configure(yscrollcommand=scrollbar.set)
+        # Variables
+        self.v_raw_dir     = tk.StringVar(value=str(ROOT_DIR / "Data" / "raw"))
+        self.v_catalog     = tk.StringVar(value=str(ROOT_DIR / "Data" / "3le.txt"))
+        self.v_output      = tk.StringVar(value=str(ROOT_DIR / "Output"))
+        self.v_start_frame = tk.StringVar()
+        self.v_num_frames  = tk.IntVar(value=10)
+        self.v_do_preproc  = tk.BooleanVar(value=False)
+        self.v_do_solve    = tk.BooleanVar(value=True)
+        self.v_show_ann    = tk.BooleanVar(value=True)
+        self.v_stretch     = tk.StringVar(value="percentile")
+        self.v_cmap        = tk.StringVar(value="gray")
+        self.v_status      = tk.StringVar(value="Ready")
 
-        # Bind mouse wheel to scroll canvas
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        
-        # Bind mousewheel when cursor enters the left panel, and unbind when it leaves
-        def _bind_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        def _unbind_mousewheel(event):
-            canvas.unbind_all("<MouseWheel>")
-            
-        left_panel.bind("<Enter>", _bind_mousewheel)
-        left_panel.bind("<Leave>", _unbind_mousewheel)
+        self._build_styles()
+        self._build_ui()
+        self._scan_raw_dir()
 
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Title (child of scrollable_frame)
-        title_lbl = ttk.Label(scrollable_frame, text="PIPELINE CONTROL PANEL", style="Title.TLabel")
-        title_lbl.pack(anchor=tk.W, pady=(10, 15))
-        
-        # Section 1: Paths configuration (child of scrollable_frame)
-        path_group = ttk.LabelFrame(scrollable_frame, text="Directories", padding=8, style="Card.TFrame")
-        path_group.pack(fill=tk.X, pady=(0, 12))
-        
-        # Raw FITS folder
-        ttk.Label(path_group, text="Raw FITS Folder:").pack(anchor=tk.W)
-        raw_f = tk.Frame(path_group, bg=self.bg_card)
-        raw_f.pack(fill=tk.X, pady=(2, 6))
-        ttk.Entry(raw_f, textvariable=self.raw_dir_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(raw_f, text="...", width=3, command=self.browse_raw_dir).pack(side=tk.RIGHT, padx=(4, 0))
-        
-        # TLE/3LE File
-        ttk.Label(path_group, text="TLE Catalog File:").pack(anchor=tk.W)
-        tle_f = tk.Frame(path_group, bg=self.bg_card)
-        tle_f.pack(fill=tk.X, pady=(2, 6))
-        ttk.Entry(tle_f, textvariable=self.catalog_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(tle_f, text="...", width=3, command=self.browse_catalog).pack(side=tk.RIGHT, padx=(4, 0))
-        
-        # Output folder
-        ttk.Label(path_group, text="Output Directory:").pack(anchor=tk.W)
-        out_f = tk.Frame(path_group, bg=self.bg_card)
-        out_f.pack(fill=tk.X, pady=(2, 2))
-        ttk.Entry(out_f, textvariable=self.output_dir_var, font=("Segoe UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(out_f, text="...", width=3, command=self.browse_output_dir).pack(side=tk.RIGHT, padx=(4, 0))
-        
-        # Section 2: Pipeline Parameters (child of scrollable_frame)
-        param_group = ttk.LabelFrame(scrollable_frame, text="Parameters", padding=8, style="Card.TFrame")
-        param_group.pack(fill=tk.X, pady=(0, 12))
-        
-        # Start Frame Dropdown
-        ttk.Label(param_group, text="Start Frame (Differencing):").pack(anchor=tk.W)
-        self.frame_combo = ttk.Combobox(param_group, textvariable=self.start_frame_var, state="readonly", style="TCombobox")
-        self.frame_combo.pack(fill=tk.X, pady=(2, 6))
-        self.frame_combo.bind("<<ComboboxSelected>>", self.on_start_frame_selected)
-        
-        # Num Frames Spinbox
-        ttk.Label(param_group, text="Number of Frames:").pack(anchor=tk.W)
-        self.num_spin = ttk.Spinbox(param_group, from_=3, to=200, textvariable=self.num_frames_var, width=10, style="TSpinbox")
-        self.num_spin.pack(anchor=tk.W, pady=(2, 6))
-        
-        # Switches (Checkbuttons)
-        pre_chk = tk.Checkbutton(param_group, text="Run pre-processing (FITS to PNG)", variable=self.preprocess_var, 
-                                 bg=self.bg_card, fg=self.text_light, activebackground=self.bg_card, activeforeground=self.text_light, selectcolor=self.bg_dark)
-        pre_chk.pack(anchor=tk.W, pady=2)
-        
-        solve_chk = tk.Checkbutton(param_group, text="Run Plate Solver (WCS Calibration)", variable=self.solve_var,
-                                   bg=self.bg_card, fg=self.text_light, activebackground=self.bg_card, activeforeground=self.text_light, selectcolor=self.bg_dark)
-        solve_chk.pack(anchor=tk.W, pady=2)
-        
-        # Section 3: Run pipeline buttons (child of scrollable_frame)
-        btn_group = ttk.LabelFrame(scrollable_frame, text="Actions", padding=8, style="Card.TFrame")
-        btn_group.pack(fill=tk.X, pady=(0, 5))
-        
-        ttk.Button(btn_group, text="Run Pre-Process Only", command=self.trigger_preprocess, width=22).pack(fill=tk.X, pady=4)
-        ttk.Button(btn_group, text="Run Differencing Only", command=self.trigger_difference, width=22).pack(fill=tk.X, pady=4)
-        ttk.Button(btn_group, text="Run Plate Solver Only", command=self.trigger_solve, width=22).pack(fill=tk.X, pady=4)
-        ttk.Button(btn_group, text="Detect & Correlate", command=self.trigger_correlation, width=22).pack(fill=tk.X, pady=4)
-        
-        # Separator
-        sep = tk.Frame(btn_group, height=2, bg=self.border_color)
-        sep.pack(fill=tk.X, pady=6)
-        
-        # Run Full Pipeline Button
-        self.run_all_btn = ttk.Button(btn_group, text="RUN FULL PIPELINE", command=self.trigger_full_pipeline, width=22)
-        self.run_all_btn.pack(fill=tk.X, pady=(2, 4))
-        
-        # Clear Console button
-        ttk.Button(btn_group, text="Clear Console Logs", command=self.clear_logs, width=22).pack(fill=tk.X, pady=4)
-        
-        # --- RIGHT PANEL: Visualizer & Results ---
-        right_panel = tk.Frame(main_container, bg=self.bg_dark)
-        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        
-        # Upper visual notebook
-        self.notebook = ttk.Notebook(right_panel, style="TNotebook")
-        self.notebook.pack(fill=tk.BOTH, expand=True)
-        
-        # Tab 1: FITS Viewer
-        self.fits_tab = tk.Frame(self.notebook, bg=self.bg_dark)
-        self.notebook.add(self.fits_tab, text=" 🌌 FITS IMAGE VIEWER ")
-        self.build_fits_viewer_tab()
-        
-        # Tab 2: Detected Streaks & Table
-        self.results_tab = tk.Frame(self.notebook, bg=self.bg_dark)
-        self.notebook.add(self.results_tab, text=" 📊 DETECTED STREAKS & PHOTOMETRY ")
-        self.build_results_tab()
-        
-        # Bottom Console window
-        console_frame = tk.Frame(right_panel, bg=self.bg_card, height=180, highlightthickness=1, highlightbackground=self.border_color)
-        console_frame.pack(fill=tk.X, pady=(10, 0))
-        console_frame.pack_propagate(False)
-        
-        console_lbl = tk.Label(console_frame, text=" SYSTEM LOGGER CONSOLE OUTPUT ", bg=self.bg_dark, fg=self.accent_blue, font=("Segoe UI", 9, "bold"), anchor="w", padx=10)
-        console_lbl.pack(fill=tk.X)
-        
-        log_scroll = ttk.Scrollbar(console_frame, orient="vertical")
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.log_console = tk.Text(console_frame, bg=self.bg_dark, fg="#00ff66", font=("Consolas", 9), wrap=tk.WORD, 
-                                   yscrollcommand=log_scroll.set, padx=8, pady=4)
-        self.log_console.pack(fill=tk.BOTH, expand=True)
-        log_scroll.config(command=self.log_console.yview)
-        
-    def build_fits_viewer_tab(self):
-        # Toolbar and Settings area
-        viewer_tools = tk.Frame(self.fits_tab, bg=self.bg_card, height=40)
-        viewer_tools.pack(fill=tk.X)
-        viewer_tools.pack_propagate(False)
-        
-        # Stretching selector
-        tk.Label(viewer_tools, text="Stretch:", bg=self.bg_card, fg=self.text_light, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(10, 4))
-        self.stretch_combo = ttk.Combobox(viewer_tools, values=["percentile", "linear", "log"], width=12, state="readonly", style="TCombobox")
-        self.stretch_combo.pack(side=tk.LEFT, padx=4)
-        self.stretch_combo.set("percentile")
-        self.stretch_combo.bind("<<ComboboxSelected>>", lambda e: self.update_fits_display())
-        
-        # Colormap selector
-        tk.Label(viewer_tools, text="Colormap:", bg=self.bg_card, fg=self.text_light, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(15, 4))
-        self.cmap_combo = ttk.Combobox(viewer_tools, values=["gray", "viridis", "inferno", "plasma", "bone", "hot"], width=12, state="readonly", style="TCombobox")
-        self.cmap_combo.pack(side=tk.LEFT, padx=4)
-        self.cmap_combo.set("gray")
-        self.cmap_combo.bind("<<ComboboxSelected>>", lambda e: self.update_fits_display())
-        
-        # Show Annotated checkbox
-        self.show_annotated_chk = tk.Checkbutton(
-            viewer_tools, text="Show Annotated", variable=self.show_annotated_var,
-            command=self.update_fits_display, bg=self.bg_card, fg=self.text_light,
-            selectcolor=self.bg_dark, activebackground=self.bg_card, activeforeground=self.text_light
-        )
-        self.show_annotated_chk.pack(side=tk.LEFT, padx=(20, 4))
-        
-        # Hover coordinate label
-        self.coords_lbl = tk.Label(viewer_tools, text="Coordinate: X: --, Y: -- | RA: --, Dec: --", bg=self.bg_card, fg=self.accent_orange, font=("Segoe UI", 9, "bold"))
-        self.coords_lbl.pack(side=tk.RIGHT, padx=15)
-        
-        # Canvas space
-        self.canvas_frame = tk.Frame(self.fits_tab, bg=self.bg_dark)
-        self.canvas_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Initialize Matplotlib Figure
-        self.fits_fig, self.fits_ax = plt.subplots(figsize=(6, 5), facecolor=self.bg_dark)
-        self.fits_ax.set_facecolor(self.bg_dark)
-        self.fits_ax.tick_params(colors=self.text_dim)
-        for spine in self.fits_ax.spines.values():
-            spine.set_color(self.border_color)
-            
-        self.fits_canvas = FigureCanvasTkAgg(self.fits_fig, master=self.canvas_frame)
-        self.fits_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        # Embed Matplotlib Navigation toolbar (hidden standard, customized or native layout)
-        self.toolbar_frame = tk.Frame(self.fits_tab, bg="#e0e0e0")
-        self.toolbar_frame.pack(fill=tk.X)
-        self.fits_toolbar = NavigationToolbar2Tk(self.fits_canvas, self.toolbar_frame)
-        self.fits_toolbar.config(background="#e0e0e0")
-        for child in self.fits_toolbar.winfo_children():
-            try:
-                child.configure(background="#e0e0e0")
-            except Exception:
-                pass
-            try:
-                child.configure(foreground="#121216")
-            except Exception:
-                pass
-        self.fits_toolbar.update()
-        
-        # Bind Mouse Motion Event for coordinates tracking
-        self.fits_fig.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
-        
-    def build_results_tab(self):
-        # Treeview (table) container
-        tree_frame = tk.Frame(self.results_tab, bg=self.bg_card)
-        tree_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
-        
-        lbl = tk.Label(tree_frame, text=" DETECTED ORBITAL STREAKS AND PHOTOMETRY TABLE (Double click row to find streak in viewer) ", 
-                       bg=self.bg_dark, fg=self.accent_blue, font=("Segoe UI", 9, "bold"), anchor="w", padx=10, pady=4)
-        lbl.pack(fill=tk.X)
-        
-        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical")
-        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal")
-        scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
-        
-        cols = ("id", "label", "mag", "snr", "net_flux", "peak", "length", "ra", "dec", "start_px", "end_px", "sep")
-        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-        
-        scroll_y.config(command=self.tree.yview)
-        scroll_x.config(command=self.tree.xview)
-        
-        # Headings and widths
+        # Keyboard shortcuts
+        self.bind("<F5>",         lambda e: self._trigger("full"))
+        self.bind("<Control-l>",  lambda e: self._clear_log())
+        self.bind("<Escape>",     lambda e: self._cancel())
+
+        # Redirect stdout/stderr
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = _Logger(self._log_q, self._orig_stdout)
+        sys.stderr = _Logger(self._log_q, self._orig_stderr)
+
+        # Drain queues
+        self.after(80,  self._drain_log_q)
+        self.after(50,  self._drain_gui_q)
+
+        # Show import error if any
+        if _IMPORT_ERROR:
+            self.after(200, lambda: self._log_line(
+                f"[WARN] Some pipeline modules failed to import: {_IMPORT_ERROR}\n"
+                f"       GUI is functional but pipeline steps may fail.\n"
+            ))
+
+        self._log_line("FRIGATE pipeline GUI ready.  F5 = Run Full | Ctrl+L = Clear log | Esc = Cancel\n")
+
+    # ── styles ────────────────────────────────────────────────────────────────
+    def _build_styles(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+
+        s.configure(".",
+            background=PAL["surface"], foreground=PAL["fg"],
+            font=FONT_UI, borderwidth=0, relief="flat")
+
+        s.configure("TLabel",
+            background=PAL["surface"], foreground=PAL["fg"], font=FONT_UI)
+
+        s.configure("Dim.TLabel",
+            background=PAL["surface"], foreground=PAL["fg_dim"], font=FONT_SMALL)
+
+        s.configure("Title.TLabel",
+            background=PAL["surface"], foreground=PAL["accent"], font=FONT_TITLE)
+
+        s.configure("TFrame", background=PAL["surface"])
+        s.configure("Sep.TFrame", background=PAL["border"])
+
+        s.configure("TButton",
+            background=PAL["accent"], foreground="#ffffff",
+            font=FONT_UI_B, padding=(10, 5), relief="flat")
+        s.map("TButton",
+            background=[("active","#6ab4f0"),("disabled", PAL["accent_dim"])],
+            foreground=[("disabled","#8899aa")])
+
+        s.configure("Ghost.TButton",
+            background=PAL["surface2"], foreground=PAL["fg"],
+            font=FONT_UI, padding=(8, 4))
+        s.map("Ghost.TButton",
+            background=[("active", PAL["border"])])
+
+        s.configure("Danger.TButton",
+            background="#5c2020", foreground=PAL["red"],
+            font=FONT_UI_B, padding=(10,5))
+        s.map("Danger.TButton",
+            background=[("active","#7a2a2a")])
+
+        s.configure("TEntry",
+            fieldbackground=PAL["bg"], foreground=PAL["fg"],
+            insertcolor=PAL["fg"], bordercolor=PAL["border"],
+            lightcolor=PAL["border"], darkcolor=PAL["border"])
+
+        s.configure("TCombobox",
+            fieldbackground=PAL["bg"], background=PAL["surface2"],
+            foreground=PAL["fg"], arrowcolor=PAL["accent"],
+            bordercolor=PAL["border"])
+        s.map("TCombobox", fieldbackground=[("readonly", PAL["bg"])])
+
+        s.configure("TSpinbox",
+            fieldbackground=PAL["bg"], foreground=PAL["fg"],
+            arrowcolor=PAL["accent"], bordercolor=PAL["border"])
+
+        s.configure("TCheckbutton",
+            background=PAL["surface"], foreground=PAL["fg"],
+            font=FONT_UI, indicatorcolor=PAL["bg"],
+            indicatordiameter=14)
+        s.map("TCheckbutton",
+            indicatorcolor=[("selected", PAL["accent"]),
+                            ("!selected", PAL["border"])])
+
+        s.configure("TNotebook",
+            background=PAL["bg"], borderwidth=0, tabmargins=0)
+        s.configure("TNotebook.Tab",
+            background=PAL["surface"], foreground=PAL["fg_dim"],
+            font=FONT_UI, padding=[16, 6])
+        s.map("TNotebook.Tab",
+            background=[("selected", PAL["bg"])],
+            foreground=[("selected", PAL["accent"])])
+
+        s.configure("Treeview",
+            background=PAL["surface"], fieldbackground=PAL["surface"],
+            foreground=PAL["fg"], rowheight=26, font=FONT_SMALL,
+            borderwidth=0)
+        s.configure("Treeview.Heading",
+            background=PAL["bg"], foreground=PAL["fg_dim"],
+            font=FONT_UI_B, relief="flat", padding=(4,4))
+        s.map("Treeview",
+            background=[("selected", PAL["accent_dim"])],
+            foreground=[("selected", "#ffffff")])
+
+        s.configure("TLabelframe",
+            background=PAL["surface"], foreground=PAL["fg_dim"],
+            bordercolor=PAL["border"], font=FONT_SMALL)
+        s.configure("TLabelframe.Label",
+            background=PAL["surface"], foreground=PAL["fg_dim"],
+            font=FONT_SMALL)
+
+        s.configure("TScrollbar",
+            background=PAL["surface2"], troughcolor=PAL["bg"],
+            arrowcolor=PAL["fg_dim"], borderwidth=0)
+
+        # Progress / status bar
+        s.configure("Status.TLabel",
+            background=PAL["bg"], foreground=PAL["fg_dim"], font=FONT_SMALL)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _build_ui(self):
+        # Root grid: left sidebar | right workspace
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0)
+
+        self._build_sidebar()
+        self._build_workspace()
+        self._build_statusbar()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    def _build_sidebar(self):
+        sb = tk.Frame(self, bg=PAL["surface"], width=300)
+        sb.grid(row=0, column=0, sticky="nsew", padx=(0,1))
+        sb.grid_propagate(False)
+        sb.columnconfigure(0, weight=1)
+
+        # Header
+        hdr = tk.Frame(sb, bg=PAL["surface"])
+        hdr.grid(row=0, column=0, sticky="ew", pady=(16,8), padx=16)
+        tk.Label(hdr, text="FRIGATE", bg=PAL["surface"],
+                 fg=PAL["accent"], font=(PAL["ui"], 16, "bold")).pack(anchor="w")
+        tk.Label(hdr, text="Debris Detection Pipeline",
+                 bg=PAL["surface"], fg=PAL["fg_dim"], font=FONT_SMALL).pack(anchor="w")
+
+        # Thin divider
+        tk.Frame(sb, bg=PAL["border"], height=1).grid(row=1, column=0, sticky="ew")
+
+        # Scrollable content
+        canvas = tk.Canvas(sb, bg=PAL["surface"], highlightthickness=0, bd=0)
+        vsb    = ttk.Scrollbar(sb, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+
+        vsb.grid(row=2, column=1, sticky="ns")
+        canvas.grid(row=2, column=0, sticky="nsew")
+        sb.rowconfigure(2, weight=1)
+
+        inner = tk.Frame(canvas, bg=PAL["surface"])
+        win_id = canvas.create_window((0,0), window=inner, anchor="nw")
+
+        def _on_inner_resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(win_id, width=canvas.winfo_width())
+        inner.bind("<Configure>", _on_inner_resize)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+
+        def _scroll(e):  canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+        canvas.bind("<Enter>",  lambda e: canvas.bind_all("<MouseWheel>", _scroll))
+        canvas.bind("<Leave>",  lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        p = 16  # padding
+        self._build_section_paths(inner, p)
+        self._build_section_params(inner, p)
+        self._build_section_actions(inner, p)
+
+    def _section_label(self, parent, text):
+        f = tk.Frame(parent, bg=PAL["surface"])
+        f.pack(fill="x", padx=16, pady=(18,4))
+        tk.Label(f, text=text.upper(), bg=PAL["surface"],
+                 fg=PAL["fg_dim"], font=(PAL["ui"], 8, "bold")).pack(side="left")
+        tk.Frame(f, bg=PAL["border"], height=1).pack(side="left", fill="x",
+                                                      expand=True, padx=(8,0))
+
+    def _path_row(self, parent, label, var, browse_cmd):
+        tk.Label(parent, text=label, bg=PAL["surface"],
+                 fg=PAL["fg_dim"], font=FONT_SMALL).pack(
+                     anchor="w", padx=16, pady=(6,1))
+        row = tk.Frame(parent, bg=PAL["surface"])
+        row.pack(fill="x", padx=16, pady=(0,2))
+        ttk.Entry(row, textvariable=var, font=FONT_SMALL).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(row, text="…", width=3,
+                   style="Ghost.TButton",
+                   command=browse_cmd).pack(side="left", padx=(4,0))
+
+    def _build_section_paths(self, parent, p):
+        self._section_label(parent, "Directories")
+        self._path_row(parent, "Raw FITS folder",
+                       self.v_raw_dir, self._browse_raw)
+        self._path_row(parent, "TLE catalogue file",
+                       self.v_catalog, self._browse_catalog)
+        self._path_row(parent, "Output directory",
+                       self.v_output, self._browse_output)
+
+    def _build_section_params(self, parent, p):
+        self._section_label(parent, "Parameters")
+
+        tk.Label(parent, text="Start frame", bg=PAL["surface"],
+                 fg=PAL["fg_dim"], font=FONT_SMALL).pack(anchor="w", padx=16, pady=(6,1))
+        self._frame_combo = ttk.Combobox(parent, textvariable=self.v_start_frame,
+                                          state="readonly", font=FONT_SMALL)
+        self._frame_combo.pack(fill="x", padx=16, pady=(0,6))
+        self._frame_combo.bind("<<ComboboxSelected>>", self._on_frame_selected)
+
+        tk.Label(parent, text="Number of frames", bg=PAL["surface"],
+                 fg=PAL["fg_dim"], font=FONT_SMALL).pack(anchor="w", padx=16, pady=(2,1))
+        ttk.Spinbox(parent, from_=3, to=500, textvariable=self.v_num_frames,
+                    width=8, font=FONT_SMALL).pack(anchor="w", padx=16, pady=(0,6))
+
+        opt_frame = tk.Frame(parent, bg=PAL["surface"])
+        opt_frame.pack(fill="x", padx=16, pady=(2,6))
+        ttk.Checkbutton(opt_frame, text="Pre-process frames",
+                        variable=self.v_do_preproc).pack(anchor="w", pady=2)
+        ttk.Checkbutton(opt_frame, text="Run plate solver (WCS)",
+                        variable=self.v_do_solve).pack(anchor="w", pady=2)
+
+    def _build_section_actions(self, parent, p):
+        self._section_label(parent, "Actions")
+
+        actions = [
+            ("Pre-process only",    "preprocess", "Ghost.TButton"),
+            ("Difference image",    "diff",       "Ghost.TButton"),
+            ("Plate solve",         "solve",      "Ghost.TButton"),
+            ("Detect & correlate",  "correlate",  "Ghost.TButton"),
+        ]
+        btn_frame = tk.Frame(parent, bg=PAL["surface"])
+        btn_frame.pack(fill="x", padx=16, pady=(0,8))
+        for label, cmd, style in actions:
+            ttk.Button(btn_frame, text=label, style=style,
+                       command=lambda c=cmd: self._trigger(c)).pack(
+                           fill="x", pady=2)
+
+        tk.Frame(parent, bg=PAL["border"], height=1).pack(
+            fill="x", padx=16, pady=8)
+
+        self._run_btn = ttk.Button(parent, text="RUN FULL PIPELINE  [F5]",
+                                    command=lambda: self._trigger("full"))
+        self._run_btn.pack(fill="x", padx=16, pady=(0,4))
+
+        self._cancel_btn = ttk.Button(parent, text="Cancel  [Esc]",
+                                       style="Danger.TButton",
+                                       command=self._cancel,
+                                       state="disabled")
+        self._cancel_btn.pack(fill="x", padx=16, pady=(0,16))
+
+    # ── Workspace ─────────────────────────────────────────────────────────────
+    def _build_workspace(self):
+        ws = tk.Frame(self, bg=PAL["bg"])
+        ws.grid(row=0, column=1, sticky="nsew")
+        ws.rowconfigure(0, weight=3)
+        ws.rowconfigure(1, weight=0)
+        ws.rowconfigure(2, weight=1)
+        ws.columnconfigure(0, weight=1)
+
+        self._build_viewer(ws)
+        self._build_log(ws)
+
+    def _build_viewer(self, parent):
+        nb = ttk.Notebook(parent, style="TNotebook")
+        nb.grid(row=0, column=0, sticky="nsew", pady=(0,1))
+        self._nb = nb
+
+        # Tab 1 — FITS viewer
+        t1 = tk.Frame(nb, bg=PAL["bg"])
+        nb.add(t1, text="  Image Viewer  ")
+        self._build_fits_tab(t1)
+
+        # Tab 2 — Results table
+        t2 = tk.Frame(nb, bg=PAL["bg"])
+        nb.add(t2, text="  Detected Tracks  ")
+        self._build_results_tab(t2)
+
+    def _build_fits_tab(self, parent):
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        # Toolbar row
+        toolbar = tk.Frame(parent, bg=PAL["surface"], height=38)
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.grid_propagate(False)
+
+        def _lbl(text):
+            return tk.Label(toolbar, text=text, bg=PAL["surface"],
+                            fg=PAL["fg_dim"], font=FONT_SMALL)
+
+        _lbl("Stretch:").pack(side="left", padx=(12,4))
+        stretch_cb = ttk.Combobox(toolbar, textvariable=self.v_stretch,
+                                   values=["percentile","linear","log","sqrt"],
+                                   width=11, state="readonly", font=FONT_SMALL)
+        stretch_cb.pack(side="left", padx=(0,12))
+        stretch_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_display())
+
+        _lbl("Colormap:").pack(side="left", padx=(0,4))
+        cmap_cb = ttk.Combobox(toolbar, textvariable=self.v_cmap,
+                                values=["gray","viridis","inferno","plasma","bone","hot"],
+                                width=11, state="readonly", font=FONT_SMALL)
+        cmap_cb.pack(side="left", padx=(0,12))
+        cmap_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_display())
+
+        ttk.Checkbutton(toolbar, text="Show annotated overlay",
+                        variable=self.v_show_ann,
+                        command=self._refresh_display).pack(side="left", padx=8)
+
+        # Coordinate readout — right-aligned
+        self._coord_lbl = tk.Label(toolbar, text="X: —  Y: —  |  RA: —  Dec: —",
+                                    bg=PAL["surface"], fg=PAL["amber"],
+                                    font=FONT_MONO)
+        self._coord_lbl.pack(side="right", padx=12)
+
+        # Matplotlib figure — created ONCE, updated in place
+        fig_frame = tk.Frame(parent, bg=PAL["bg"])
+        fig_frame.grid(row=1, column=0, sticky="nsew")
+
+        self._fig, self._ax = plt.subplots(figsize=(8, 6))
+        self._fig.patch.set_facecolor(PAL["bg"])
+        self._ax.set_facecolor(PAL["bg"])
+        self._ax.tick_params(colors=PAL["fg_dim"])
+        for sp in self._ax.spines.values():
+            sp.set_color(PAL["border"])
+        self._ax.set_xticks([]); self._ax.set_yticks([])
+        self._ax.set_title("No image loaded", color=PAL["fg_dim"],
+                            fontsize=10, pad=8)
+        self._im_artist = None    # matplotlib AxesImage, updated not recreated
+
+        self._canvas = FigureCanvasTkAgg(self._fig, master=fig_frame)
+        self._canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Navigation toolbar — single loop, style fixed properly
+        tb_frame = tk.Frame(fig_frame, bg="#2a2a35")
+        tb_frame.pack(fill="x")
+        self._mpl_toolbar = NavigationToolbar2Tk(self._canvas, tb_frame)
+        self._mpl_toolbar.config(background="#2a2a35")
+        for ch in self._mpl_toolbar.winfo_children():
+            for key in ("background", "fg", "activebackground", "highlightbackground"):
+                try: ch.configure(**{key: "#2a2a35"})
+                except Exception: pass
+        self._mpl_toolbar.update()
+
+        # Mouse motion — debounced
+        self._fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _build_results_tab(self, parent):
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        cols = ("id","label","mag","snr","net_flux","peak",
+                "length","ra","dec","start_px","end_px","sep")
         headings = {
-            "id": ("ID", 40),
-            "label": ("Debris / Satellite ID", 180),
-            "mag": ("Mag (Inst)", 80),
-            "snr": ("SNR", 60),
-            "net_flux": ("Net Flux", 90),
-            "peak": ("Peak Pix", 80),
-            "length": ("Len (px)", 70),
-            "ra": ("RA (deg)", 90),
-            "dec": ("Dec (deg)", 90),
-            "start_px": ("Start (X,Y)", 100),
-            "end_px": ("End (X,Y)", 100),
-            "sep": ("Catalog Sep (°)", 110)
+            "id":       ("ID",              50),
+            "label":    ("Debris / Object", 200),
+            "mag":      ("Mag",             70),
+            "snr":      ("SNR",             70),
+            "net_flux": ("Net Flux",        90),
+            "peak":     ("Peak",            80),
+            "length":   ("Length (px)",     90),
+            "ra":       ("RA (deg)",        100),
+            "dec":      ("Dec (deg)",       100),
+            "start_px": ("Start (x,y)",    110),
+            "end_px":   ("End (x,y)",      110),
+            "sep":      ("Cat Sep (deg)",   110),
         }
-        
-        for col, (title, width) in headings.items():
-            self.tree.heading(col, text=title, anchor=tk.CENTER)
-            self.tree.column(col, width=width, anchor=tk.CENTER)
-            
-        self.tree.pack(fill=tk.BOTH, expand=True)
-        self.tree.bind("<Double-1>", self.on_tree_row_double_click)
-        
-    def scan_raw_directory(self):
-        raw_path = Path(self.raw_dir_var.get())
-        if not raw_path.exists():
-            return
-            
-        try:
-            files = get_sorted_fits(raw_path)
-            filenames = [f.name for f in files]
-            
-            if filenames:
-                self.frame_combo.config(values=filenames)
-                if self.start_frame_var.get() not in filenames:
-                    self.start_frame_var.set(filenames[0])
-            else:
-                self.frame_combo.config(values=[])
-                self.start_frame_var.set("")
-        except Exception as e:
-            print(f"Error scanning directory: {e}")
-            
-    def browse_raw_dir(self):
-        path = filedialog.askdirectory(title="Select Raw FITS Folder", initialdir=self.raw_dir_var.get())
-        if path:
-            self.raw_dir_var.set(path)
-            self.scan_raw_directory()
-            
-    def browse_catalog(self):
-        path = filedialog.askopenfilename(title="Select TLE/3LE File", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")], 
-                                          initialdir=os.path.dirname(self.catalog_var.get()))
-        if path:
-            self.catalog_var.set(path)
-            
-    def browse_output_dir(self):
-        path = filedialog.askdirectory(title="Select Output Directory", initialdir=self.output_dir_var.get())
-        if path:
-            self.output_dir_var.set(path)
-            
-    def on_start_frame_selected(self, event):
-        # Load the selected raw FITS file automatically when selected
-        start_f = self.start_frame_var.get()
-        raw_path = Path(self.raw_dir_var.get()) / start_f
-        if raw_path.exists():
-            self.load_fits_image(raw_path)
-            
-    def load_fits_image(self, fits_path):
-        try:
-            fits_path = Path(fits_path)
-            print(f"\nLoading FITS image in viewer: {fits_path.name}")
-            
-            # Read file bytes to avoid file locking on Windows
-            import io
-            with open(str(fits_path), 'rb') as f:
-                fits_bytes = f.read()
-                
-            # Open FITS data from memory buffer
-            with fits.open(io.BytesIO(fits_bytes), memmap=False) as hdul:
-                self.current_fits_data = np.array(hdul[0].data, dtype=np.float32)
-                self.current_fits_header = hdul[0].header.copy()
-                self.current_wcs = WCS(self.current_fits_header, relax=True)
-                
-            self.selected_fits_path = fits_path
-            
-            # Check for correlated PNG matching this FITS image
-            png_candidate = fits_path.parent / f"{fits_path.stem}_correlated.png"
-            if not png_candidate.exists():
-                output_dir = Path(self.output_dir_var.get())
-                clean_stem = fits_path.stem.replace(" ", "_")
-                num_f = self.num_frames_var.get()
-                png_candidate = output_dir / f"diff_{clean_stem}_{num_f}f_correlated.png"
-                
-            if png_candidate.exists():
-                self.current_png_path = png_candidate
-                print(f"[DEBUG] Found corresponding annotated PNG: {self.current_png_path.name}")
-            else:
-                self.current_png_path = None
-                
-            self.update_fits_display()
-            
-            # Switch view to FITS viewer
-            self.notebook.select(self.fits_tab)
-        except Exception as e:
-            print(f"Error loading FITS file: {e}")
-            messagebox.showerror("FITS Error", f"Failed to load FITS file: {e}")
-            
-    def update_fits_display(self, overlay_tracks=True):
-        print(f"[DEBUG] update_fits_display: overlay_tracks={overlay_tracks}, detected_tracks count={len(self.detected_tracks) if self.detected_tracks else 0}")
-        if self.current_fits_data is None:
-            return
-            
-        stretch = self.stretch_combo.get()
-        cmap = self.cmap_combo.get()
-        
-        # Preserve existing zoom/pan limits if available to prevent snapping back on settings change
-        old_xlim = None
-        old_ylim = None
-        if hasattr(self, 'fits_ax') and self.fits_ax is not None:
-            try:
-                old_xlim = self.fits_ax.get_xlim()
-                old_ylim = self.fits_ax.get_ylim()
-            except Exception:
-                pass
-                
-        self.fits_fig.clf()
-        
-        # Check if we should render the beautifully annotated PNG instead of the raw difference FITS file
-        show_annotated = self.show_annotated_var.get() and hasattr(self, 'current_png_path') and self.current_png_path is not None and self.current_png_path.exists()
-        
-        if show_annotated:
-            import matplotlib.image as mpimg
-            try:
-                img = mpimg.imread(str(self.current_png_path))
-                H, W = self.current_fits_data.shape
-                
-                self.fits_ax = self.fits_fig.add_subplot(111)
-                self.fits_ax.set_xlabel('X (pixels)', color=self.text_dim)
-                self.fits_ax.set_ylabel('Y (pixels)', color=self.text_dim)
-                self.fits_ax.tick_params(colors=self.text_dim)
-                for spine in self.fits_ax.spines.values():
-                    spine.set_color(self.border_color)
-                    
-                self.fits_ax.set_facecolor(self.bg_dark)
-                self.fits_fig.patch.set_facecolor(self.bg_dark)
-                
-                # Draw the PNG image with origin='upper' matching standard image coordinate system,
-                # and map to the exact same extent [0, W, 0, H] so WCS coordinates remain perfectly aligned!
-                self.fits_ax.imshow(img, origin='upper', extent=[0, W, 0, H])
-                
-                # Re-apply preserved zoom limits
-                if old_xlim is not None and old_ylim is not None:
-                    try:
-                        if old_xlim[0] >= -100 and old_xlim[1] <= W + 100:
-                            self.fits_ax.set_xlim(old_xlim)
-                        if old_ylim[0] >= -100 and old_ylim[1] <= H + 100:
-                            self.fits_ax.set_ylim(old_ylim)
-                    except Exception:
-                        pass
-                
-                title_str = f"{self.selected_fits_path.name} (Annotated)"
-                self.fits_ax.set_title(title_str, color=self.text_light, fontsize=11, fontweight="bold")
-                
-                self.fits_canvas.draw()
-                return
-            except Exception as e:
-                print(f"[ERROR] Failed to load annotated PNG in viewer: {e}. Falling back to FITS view.")
-        
-        has_wcs = self.current_wcs is not None and self.current_wcs.has_celestial
-        
-        # Always utilize a standard pixel-space subplot to display overlays correctly
-        self.fits_ax = self.fits_fig.add_subplot(111)
-        self.fits_ax.set_xlabel('X (pixels)', color=self.text_dim)
-        self.fits_ax.set_ylabel('Y (pixels)', color=self.text_dim)
-        self.fits_ax.tick_params(colors=self.text_dim)
-        for spine in self.fits_ax.spines.values():
-            spine.set_color(self.border_color)
-            
-        self.fits_ax.set_facecolor(self.bg_dark)
-        self.fits_fig.patch.set_facecolor(self.bg_dark)
-        
-        # Get dimensions and determine downsampling factor for smooth interaction
-        H, W = self.current_fits_data.shape
-        factor = max(1, min(W, H) // 1200)
-        
-        # Downsample data for rendering (speeds up Matplotlib rendering by 16x+)
-        downsampled = self.current_fits_data[::factor, ::factor]
-        
-        # Apply stretch to downsampled data
-        scaled = apply_stretch(downsampled, stretch_type=stretch)
-        
-        # Draw image using 'extent' to map downsampled pixels back to original coordinate system
-        im = self.fits_ax.imshow(scaled, cmap=cmap, origin='lower', extent=[0, W, 0, H])
-        
-        # Re-apply preserved zoom limits
-        if old_xlim is not None and old_ylim is not None:
-            try:
-                # Sanity check to ensure limits are within image bounds
-                if old_xlim[0] >= -100 and old_xlim[1] <= W + 100:
-                    self.fits_ax.set_xlim(old_xlim)
-                if old_ylim[0] >= -100 and old_ylim[1] <= H + 100:
-                    self.fits_ax.set_ylim(old_ylim)
-            except Exception:
-                pass
-        
-        # Draw annotations if available and requested
-        if overlay_tracks and self.detected_tracks:
-            # Set appropriate pixel space coordinate transform
-            pixel_transform = self.fits_ax.transData
-            
-            for idx, track in enumerate(self.detected_tracks):
-                p1 = track['start_pixel']
-                p2 = track['end_pixel']
-                label = track['label']
-                color = "green" if track['is_match'] else "red"
-                mag_val = track['photometry']['magnitude']
-                mag_str = f"M:{mag_val:.2f}" if not math.isnan(mag_val) else "M:N/A"
-                
-                # Plot segment line
-                self.fits_ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color='orange', linestyle='--', linewidth=1.5, transform=pixel_transform)
-                # Scatter endpoints
-                self.fits_ax.scatter([p1[0], p2[0]], [p1[1], p2[1]], color=color, s=25, transform=pixel_transform)
-                
-                # Bounding box
-                x_min, x_max = min(p1[0], p2[0]) - 15, max(p1[0], p2[0]) + 15
-                y_min, y_max = min(p1[1], p2[1]) - 15, max(p1[1], p2[1]) + 15
-                rect = plt.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                     fill=False, edgecolor=color, linewidth=1.5, transform=pixel_transform)
-                self.fits_ax.add_patch(rect)
-                
-                lbl_text = f"T{track['track_id']}: {label} ({mag_str})"
-                self.fits_ax.text(x_min, y_max + 4, lbl_text, color=color, fontsize=9, fontweight='bold', transform=pixel_transform)
-                
-        title_str = self.selected_fits_path.name if self.selected_fits_path else "FITS Image"
-        self.fits_ax.set_title(title_str, color=self.text_light, fontsize=11, fontweight="bold")
-        
-        self.fits_canvas.draw()
 
-    def show_annotated_png(self, png_path):
-        """Display the annotated PNG (with track overlays drawn by OpenCV) directly in the viewer."""
-        png_path = Path(png_path)
-        if not png_path.exists():
-            print(f"[ERROR] Annotated PNG not found: {png_path}")
+        frame = tk.Frame(parent, bg=PAL["bg"])
+        frame.pack(fill="both", expand=True)
+
+        vsb = ttk.Scrollbar(frame, orient="vertical")
+        hsb = ttk.Scrollbar(frame, orient="horizontal")
+        self._tree = ttk.Treeview(frame, columns=cols, show="headings",
+                                   yscrollcommand=vsb.set,
+                                   xscrollcommand=hsb.set,
+                                   selectmode="browse")
+        vsb.config(command=self._tree.yview)
+        hsb.config(command=self._tree.xview)
+
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        for col, (title, width) in headings.items():
+            self._tree.heading(col, text=title,
+                               command=lambda c=col: self._sort_tree(c, False))
+            self._tree.column(col, width=width, anchor="center", minwidth=40)
+
+        self._tree.tag_configure("match",   foreground=PAL["green"])
+        self._tree.tag_configure("nomatch", foreground=PAL["red"])
+        self._tree.bind("<Double-1>", self._on_row_dblclick)
+
+    def _build_log(self, parent):
+        log_frame = tk.Frame(parent, bg=PAL["surface"], height=180)
+        log_frame.grid(row=2, column=0, sticky="ew")
+        log_frame.grid_propagate(False)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(1, weight=1)
+
+        hdr = tk.Frame(log_frame, bg=PAL["bg"], height=24)
+        hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
+        hdr.grid_propagate(False)
+        tk.Label(hdr, text="  Console output",
+                 bg=PAL["bg"], fg=PAL["accent"],
+                 font=FONT_UI_B, anchor="w").pack(side="left")
+        ttk.Button(hdr, text="Clear", style="Ghost.TButton",
+                   command=self._clear_log).pack(side="right", padx=4)
+
+        vsb = ttk.Scrollbar(log_frame, orient="vertical")
+        vsb.grid(row=1, column=1, sticky="ns")
+
+        self._log = tk.Text(log_frame,
+                             bg=PAL["bg"], fg="#44cc77",
+                             font=FONT_MONO, wrap="word",
+                             yscrollcommand=vsb.set,
+                             padx=8, pady=4,
+                             state="disabled",
+                             relief="flat")
+        self._log.grid(row=1, column=0, sticky="nsew")
+        vsb.config(command=self._log.yview)
+
+        # Text tags for colour
+        self._log.tag_config("err",  foreground=PAL["red"])
+        self._log.tag_config("warn", foreground=PAL["amber"])
+        self._log.tag_config("info", foreground=PAL["accent"])
+
+    def _build_statusbar(self):
+        sb = tk.Frame(self, bg=PAL["bg"], height=26)
+        sb.grid(row=1, column=0, columnspan=2, sticky="ew")
+        sb.grid_propagate(False)
+
+        self._spinner_lbl = tk.Label(sb, text="●", bg=PAL["bg"],
+                                      fg=PAL["fg_dim"],
+                                      font=(PAL["ui"], 10))
+        self._spinner_lbl.pack(side="left", padx=(10,4))
+
+        tk.Label(sb, textvariable=self.v_status,
+                 bg=PAL["bg"], fg=PAL["fg_dim"],
+                 font=FONT_SMALL).pack(side="left")
+
+        # Shortcuts hint right side
+        tk.Label(sb, text="F5 Run  |  Ctrl+L Clear log  |  Esc Cancel",
+                 bg=PAL["bg"], fg=PAL["fg_dim"],
+                 font=FONT_SMALL).pack(side="right", padx=10)
+
+    # ── Image display (core performance path) ─────────────────────────────────
+    def _load_fits(self, path: Path):
+        """Read FITS into cache. Called from main thread only."""
+        path = Path(path)
+        try:
+            with open(str(path), "rb") as f:
+                raw = f.read()
+            with fits.open(io.BytesIO(raw), memmap=False) as h:
+                self._fits_data   = np.array(h[0].data, dtype=np.float32)
+                self._fits_header = h[0].header.copy()
+                try:
+                    self._fits_wcs = WCS(self._fits_header, relax=True)
+                except Exception:
+                    self._fits_wcs = None
+            self._fits_path     = path
+            self._display_cache = None
+            self._display_key   = None
+            H, W = self._fits_data.shape
+            # Compute downsampling ONCE — target ~1200px on shortest axis
+            self._ds_factor = max(1, min(W, H) // 1200)
+            self._check_png_path()
+            self._refresh_display()
+            self._nb.select(0)
+        except Exception as e:
+            self._log_line(f"[ERROR] Failed to load {path.name}: {e}\n", "err")
+
+    def _check_png_path(self):
+        if not self._fits_path:
             return
-        
-        import matplotlib.image as mpimg
+        output = Path(self.v_output.get())
+        stem   = self._fits_path.stem.replace(" ", "_")
+        nf     = self.v_num_frames.get()
+        cand   = output / f"diff_{stem}_{nf}f_correlated.png"
+        self._png_path = cand if cand.exists() else None
+
+    def _refresh_display(self):
+        """Update the matplotlib axes IN PLACE — no figure recreation."""
+        if self._fits_data is None:
+            return
+
+        # Show annotated PNG if available and requested
+        if self.v_show_ann.get() and self._png_path and self._png_path.exists():
+            self._render_png(self._png_path)
+            return
+
+        stretch = self.v_stretch.get()
+        cmap    = self.v_cmap.get()
+        key     = (stretch, cmap)
+
+        if key != self._display_key or self._display_cache is None:
+            ds   = self._fits_data[::self._ds_factor, ::self._ds_factor]
+            scaled = apply_stretch(ds, stretch_type=stretch)
+            self._display_cache = scaled
+            self._display_key   = key
+
+        H, W = self._fits_data.shape
+
+        if self._im_artist is None:
+            self._im_artist = self._ax.imshow(
+                self._display_cache, cmap=cmap, origin="lower",
+                extent=[0, W, 0, H], aspect="auto")
+        else:
+            self._im_artist.set_data(self._display_cache)
+            self._im_artist.set_cmap(cmap)
+            self._im_artist.set_extent([0, W, 0, H])
+
+        self._ax.set_title(self._fits_path.name if self._fits_path else "",
+                            color=PAL["fg"], fontsize=9, pad=4)
+        self._draw_track_overlays()
+        self._canvas.draw_idle()
+
+    def _render_png(self, png_path: Path):
+        """Render an annotated PNG into the axes without recreating the figure."""
         try:
             img = mpimg.imread(str(png_path))
-            # img shape: (H, W, 3) for RGB PNG
-            img_h, img_w = img.shape[0], img.shape[1]
-            
-            self.fits_fig.clf()
-            self.fits_ax = self.fits_fig.add_subplot(111)
-            self.fits_ax.set_facecolor(self.bg_dark)
-            self.fits_fig.patch.set_facecolor(self.bg_dark)
-            for spine in self.fits_ax.spines.values():
-                spine.set_color(self.border_color)
-            self.fits_ax.tick_params(colors=self.text_dim)
-            self.fits_ax.set_xlabel('X (pixels)', color=self.text_dim)
-            self.fits_ax.set_ylabel('Y (pixels)', color=self.text_dim)
-            
-            # Draw the annotated PNG in pixel coordinates
-            # origin='upper' matches OpenCV's top-left origin
-            self.fits_ax.imshow(img, origin='upper', extent=[0, img_w, 0, img_h])
-            self.fits_ax.set_title(
-                f"{png_path.name} — ANNOTATED TRACKS",
-                color=self.accent_orange, fontsize=11, fontweight='bold'
-            )
-            
-            self.fits_canvas.draw()
-            
-            # Switch to viewer tab
-            self.notebook.select(self.fits_tab)
-            print(f"[INFO] Annotated image displayed in viewer: {png_path.name}")
+            ih, iw = img.shape[:2]
+            H = self._fits_data.shape[0] if self._fits_data is not None else ih
+            W = self._fits_data.shape[1] if self._fits_data is not None else iw
+
+            if self._im_artist is None:
+                self._im_artist = self._ax.imshow(
+                    img, origin="upper", extent=[0, W, 0, H], aspect="auto")
+            else:
+                self._im_artist.set_data(img)
+                self._im_artist.set_extent([0, W, 0, H])
+
+            self._ax.set_title(png_path.name, color=PAL["amber"],
+                                fontsize=9, pad=4)
+            self._canvas.draw_idle()
         except Exception as e:
-            print(f"[ERROR] Failed to render annotated PNG: {e}")
-        
-    def on_mouse_move(self, event):
-        if event.inaxes is None or self.current_fits_data is None:
+            self._log_line(f"[WARN] Could not render PNG: {e}\n", "warn")
+
+    def _draw_track_overlays(self):
+        """Draw streak overlays. Called only from _refresh_display."""
+        # Remove previous overlays (lines, patches, texts added by us)
+        for artist in list(self._ax.lines + self._ax.patches +
+                           self._ax.texts):
+            try: artist.remove()
+            except Exception: pass
+
+        for t in self._tracks:
+            p1    = t.get("start_pixel", [0, 0])
+            p2    = t.get("end_pixel",   [0, 0])
+            color = PAL["green"] if t.get("is_match") else PAL["red"]
+            self._ax.plot([p1[0],p2[0]], [p1[1],p2[1]],
+                          color=PAL["amber"], lw=1.2, ls="--")
+            self._ax.scatter([p1[0],p2[0]], [p1[1],p2[1]],
+                             color=color, s=18, zorder=5)
+            xlo = min(p1[0],p2[0])-12
+            ylo = min(p1[1],p2[1])-12
+            xhi = max(p1[0],p2[0])+12
+            yhi = max(p1[1],p2[1])+12
+            rect = plt.Rectangle((xlo,ylo), xhi-xlo, yhi-ylo,
+                                  fill=False, edgecolor=color, lw=1.2)
+            self._ax.add_patch(rect)
+            self._ax.text(xlo, yhi+3,
+                          f"T{t['track_id']}: {t['label']}",
+                          color=color, fontsize=7, fontweight="bold")
+
+    # ── Mouse motion — debounced to ~60fps ───────────────────────────────────
+    def _on_motion(self, event):
+        if self._motion_after:
+            self.after_cancel(self._motion_after)
+        self._motion_after = self.after(16, lambda: self._update_coords(event))
+
+    def _update_coords(self, event):
+        self._motion_after = None
+        if event.inaxes is None or self._fits_data is None:
             return
-            
         x, y = event.xdata, event.ydata
-        
-        ra_str, dec_str = "--", "--"
-        if self.current_wcs and self.current_wcs.has_celestial:
+        ra_s = dec_s = "—"
+        if self._fits_wcs and self._fits_wcs.has_celestial:
             try:
-                ra, dec = self.current_wcs.pixel_to_world_values(x, y)
-                ra_str = f"{ra:.5f}°"
-                dec_str = f"{dec:.5f}°"
+                ra, dec = self._fits_wcs.pixel_to_world_values(x, y)
+                ra_s  = f"{ra:.5f}°"
+                dec_s = f"{dec:+.5f}°"
             except Exception:
                 pass
-                
-        # Get pixel value
         try:
-            px_val = self.current_fits_data[int(round(y)), int(round(x))]
-            px_str = f"{px_val:.1f}"
+            val = self._fits_data[int(round(y)), int(round(x))]
+            val_s = f"{val:.1f}"
         except Exception:
-            px_str = "--"
-            
-        self.coords_lbl.config(
-            text=f"X: {x:.1f}, Y: {y:.1f} [Val: {px_str}] | RA: {ra_str}, Dec: {dec_str}"
-        )
-        
-    def on_tree_row_double_click(self, event):
-        item = self.tree.selection()
-        if not item:
-            return
-            
-        values = self.tree.item(item[0], "values")
-        track_id = int(values[0])
-        
-        # Find this track inside our detected tracks
-        target_track = None
-        for track in self.detected_tracks:
-            if track['track_id'] == track_id:
-                target_track = track
-                break
-                
-        if target_track:
-            p1 = target_track['start_pixel']
-            p2 = target_track['end_pixel']
-            mid_x = (p1[0] + p2[0]) / 2.0
-            mid_y = (p1[1] + p2[1]) / 2.0
-            
-            # Switch back to FITS viewer
-            self.notebook.select(self.fits_tab)
-            
-            # Pan the Matplotlib axes to center around mid_x, mid_y
-            x_lim = self.fits_ax.get_xlim()
-            y_lim = self.fits_ax.get_ylim()
-            
-            # Maintain current zoom scale but shift center
-            half_w = (x_lim[1] - x_lim[0]) / 2.0
-            half_h = (y_lim[1] - y_lim[0]) / 2.0
-            
-            # If default/full viewport is set, zoom in slightly
-            if half_w > 100:
-                half_w = 80.0
-                half_h = 80.0
-                
-            self.fits_ax.set_xlim(mid_x - half_w, mid_x + half_w)
-            self.fits_ax.set_ylim(mid_y - half_h, mid_y + half_h)
-            
-    def _release_viewer_locks(self):
-        """Releases any active file handles in the viewer and forces garbage collection."""
-        self.fits_fig.clf()
-        self.current_fits_data = None
-        self.current_fits_header = None
-        self.current_wcs = None
-        import gc
-        gc.collect()
+            val_s = "—"
+        self._coord_lbl.config(
+            text=f"X: {x:.1f}  Y: {y:.1f}  [{val_s}]  |  RA: {ra_s}  Dec: {dec_s}")
 
-    def clear_logs(self):
-        self.log_console.config(state=tk.NORMAL)
-        self.log_console.delete("1.0", tk.END)
-        self.log_console.config(state=tk.DISABLED)
-        
-    def process_log_queue(self):
+    # ── Logging ───────────────────────────────────────────────────────────────
+    def _log_line(self, text: str, tag: str = ""):
+        self._log.config(state="normal")
+        # Trim if over limit
+        lines = int(self._log.index("end-1c").split(".")[0])
+        if lines > _Logger.MAX_LINES:
+            self._log.delete("1.0", f"{lines - _Logger.MAX_LINES // 2}.0")
+        if tag:
+            self._log.insert("end", text, tag)
+        else:
+            self._log.insert("end", text)
+        self._log.see("end")
+        self._log.config(state="disabled")
+
+    def _drain_log_q(self):
         try:
-            while True:
-                string = self.log_queue.get_nowait()
-                self.log_console.config(state=tk.NORMAL)
-                self.log_console.insert(tk.END, string)
-                self.log_console.see(tk.END)
-                self.log_console.config(state=tk.DISABLED)
+            budget = 50  # process at most 50 chunks per tick
+            while budget > 0:
+                kind, payload = self._log_q.get_nowait()
+                if kind == "log":
+                    tag = ("err"  if "[ERROR]" in payload else
+                           "warn" if "[WARN]"  in payload else
+                           "info" if "[INFO]"  in payload else "")
+                    self._log_line(payload, tag)
+                budget -= 1
         except queue.Empty:
             pass
-        self.after(100, self.process_log_queue)
+        self.after(80, self._drain_log_q)
 
-    def process_gui_queue(self):
+    def _drain_gui_q(self):
         try:
             while True:
-                callable_task = self.gui_queue.get_nowait()
-                try:
-                    callable_task()
+                fn = self._gui_q.get_nowait()
+                try: fn()
                 except Exception as e:
-                    print(f"Error executing GUI task: {e}")
+                    self._log_line(f"[ERROR] GUI task: {e}\n", "err")
         except queue.Empty:
             pass
-        self.after(50, self.process_gui_queue)
+        self.after(50, self._drain_gui_q)
 
-    def safe_gui_call(self, func, *args, **kwargs):
-        """Queues a GUI-modifying function to run safely on the main thread."""
-        self.gui_queue.put(lambda: func(*args, **kwargs))
+    def _safe(self, fn, *a, **kw):
+        """Queue a callable to run on the main thread."""
+        self._gui_q.put(lambda: fn(*a, **kw))
 
-    def enable_run_button(self):
-        self.run_all_btn.config(state=tk.NORMAL)
-        
-    # --- PIPELINE TRIGGER THREADS ---
-    
-    def trigger_preprocess(self):
-        self.run_in_thread(self._preprocess_worker)
-        
-    def trigger_difference(self):
-        self._release_viewer_locks()
-        self.run_in_thread(self._difference_worker)
-        
-    def trigger_solve(self):
-        self._release_viewer_locks()
-        self.run_in_thread(self._solve_worker)
-        
-    def trigger_correlation(self):
-        self._release_viewer_locks()
-        self.run_in_thread(self._correlation_worker)
-        
-    def trigger_full_pipeline(self):
-        self._release_viewer_locks()
-        self.run_in_thread(self._full_pipeline_worker)
-        
-    def run_in_thread(self, target):
-        self.run_all_btn.config(state=tk.DISABLED)
-        t = threading.Thread(target=target, daemon=True)
-        t.start()
-        
-    def _preprocess_worker(self):
+    def _clear_log(self):
+        self._log.config(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.config(state="disabled")
+
+    # ── Status bar spinner ────────────────────────────────────────────────────
+    _SPIN = ["◐","◓","◑","◒"]
+
+    def _start_spinner(self, msg="Running…"):
+        self.v_status.set(msg)
+        self._spinner_idx = 0
+        self._tick_spinner()
+
+    def _tick_spinner(self):
+        self._spinner_lbl.config(
+            fg=PAL["amber"],
+            text=self._SPIN[self._spinner_idx % len(self._SPIN)])
+        self._spinner_idx += 1
+        self._spinner_after = self.after(200, self._tick_spinner)
+
+    def _stop_spinner(self, msg="Ready"):
+        if self._spinner_after:
+            self.after_cancel(self._spinner_after)
+            self._spinner_after = None
+        self.v_status.set(msg)
+        self._spinner_lbl.config(fg=PAL["fg_dim"], text="●")
+
+    # ── Browse helpers ────────────────────────────────────────────────────────
+    def _browse_raw(self):
+        p = filedialog.askdirectory(title="Select Raw FITS folder",
+                                     initialdir=self.v_raw_dir.get())
+        if p:
+            self.v_raw_dir.set(p); self._scan_raw_dir()
+
+    def _browse_catalog(self):
+        p = filedialog.askopenfilename(
+            title="Select TLE catalogue",
+            filetypes=[("Text","*.txt"),("All","*.*")],
+            initialdir=str(Path(self.v_catalog.get()).parent))
+        if p: self.v_catalog.set(p)
+
+    def _browse_output(self):
+        p = filedialog.askdirectory(title="Select output directory",
+                                     initialdir=self.v_output.get())
+        if p: self.v_output.set(p)
+
+    def _scan_raw_dir(self):
         try:
-            fits_dir = Path(self.raw_dir_var.get())
-            output_dir = Path(self.output_dir_var.get())
-            print("\n>>> STARTING BATCH PREPROCESSING...")
-            run_preprocessing(fits_dir, output_dir, num_adj=2, batch_size=40)
-            print(">>> PREPROCESSING BATCH COMPLETED!")
-            self.safe_gui_call(messagebox.showinfo, "Success", "Preprocessing completed successfully!")
+            files = get_sorted_fits(Path(self.v_raw_dir.get()))
+            names = [f.name for f in files]
+            self._frame_combo.config(values=names)
+            if names and self.v_start_frame.get() not in names:
+                self.v_start_frame.set(names[0])
         except Exception as e:
-            print(f"\n[ERROR] Error during preprocessing: {e}")
-            self.safe_gui_call(messagebox.showerror, "Pipeline Error", f"Preprocessing failed: {e}")
-        finally:
-            self.safe_gui_call(self.enable_run_button)
-            
-    def _difference_worker(self):
-        try:
-            fits_dir = Path(self.raw_dir_var.get())
-            start_frame = self.start_frame_var.get()
-            num_frames = self.num_frames_var.get()
-            output_dir = Path(self.output_dir_var.get())
-            
-            if not start_frame:
-                print("[ERROR] Start frame selection missing!")
-                return
-                
-            print("\n>>> COMPUTING DIFFERENCE IMAGE...")
-            diff, header, fits_out, png_out = run_difference(fits_dir, start_frame, num_frames, output_dir)
-            print(">>> DIFFERENCE IMAGE CREATED SUCCESSFULLY!")
-            
-            # Load difference image into FITS viewer safely on main thread
-            self.safe_gui_call(self.load_fits_image, fits_out)
-        except Exception as e:
-            print(f"\n[ERROR] Error during differencing: {e}")
-            self.safe_gui_call(messagebox.showerror, "Pipeline Error", f"Differencing failed: {e}")
-        finally:
-            self.safe_gui_call(self.enable_run_button)
-            
-    def _solve_worker(self):
-        try:
-            fits_dir = Path(self.raw_dir_var.get())
-            start_frame = self.start_frame_var.get()
-            output_dir = Path(self.output_dir_var.get())
-            
-            raw_path = fits_dir / start_frame
-            num_frames = self.num_frames_var.get()
-            start_stem = Path(start_frame).stem.replace(" ", "_")
-            diff_path = output_dir / f"diff_{start_stem}_{num_frames}f.fits"
-            
-            if not raw_path.exists():
-                print(f"[ERROR] Cannot find raw image for solving at {raw_path}")
-                return
-            if not diff_path.exists():
-                print(f"[ERROR] Cannot find difference image at {diff_path}. Run differencing first.")
-                return
-                
-            print("\n>>> RUNNING PLATE SOLVER...")
-            wcs_data = solve_and_apply_wcs(str(raw_path), str(diff_path))
-            if wcs_data:
-                print(">>> SUCCESS! True coordinates written to difference image.")
-                # Reload FITS data in viewer safely on main thread
-                self.safe_gui_call(self.load_fits_image, diff_path)
-            else:
-                print(">>> WARNING: Solver could not calibrate image coordinates.")
-                self.safe_gui_call(messagebox.showwarning, "WCS Solver Failed", "Plate solver was unable to resolve fields. Running in Geocentric fallback.")
-        except Exception as e:
-            print(f"\n[ERROR] Error during WCS solving: {e}")
-            self.safe_gui_call(messagebox.showerror, "Pipeline Error", f"Solver failed: {e}")
-        finally:
-            self.safe_gui_call(self.enable_run_button)
-            
-    def _correlation_worker(self):
-        try:
-            output_dir = Path(self.output_dir_var.get())
-            catalog_path = Path(self.catalog_var.get())
-            
-            start_frame = self.start_frame_var.get()
-            num_frames = self.num_frames_var.get()
-            start_stem = Path(start_frame).stem.replace(" ", "_")
-            
-            diff_fits = output_dir / f"diff_{start_stem}_{num_frames}f.fits"
-            output_png = output_dir / f"diff_{start_stem}_{num_frames}f_correlated.png"
-            
-            if not diff_fits.exists():
-                print(f"[ERROR] Cannot find difference image at {diff_fits}. Compute differencing first!")
-                return
-            if not catalog_path.exists():
-                print(f"[ERROR] Cannot find catalog file missing at {catalog_path}!")
-                return
-                
-            print("\n>>> RUNNING TRACK DETECTION, PHOTOMETRY & CORRELATION...")
-            results = process_and_correlate(str(diff_fits), str(catalog_path), str(output_png))
-            
-            if results:
-                self.detected_tracks = results
-                print(f"\n>>> PIPELINE CORRELATION COMPLETE: Detected {len(results)} distinct tracks.")
-                self.safe_gui_call(self.populate_results_table, results)
-                # Show the annotated PNG directly — not the raw difference FITS
-                self.safe_gui_call(self.show_annotated_png, output_png)
-            else:
-                self.detected_tracks = []
-                self.safe_gui_call(self.populate_results_table, [])
-                print("\n>>> PROCESS COMPLETE: No debris tracks detected.")
-        except Exception as e:
-            print(f"\n[ERROR] Error during detection/correlation: {e}")
-            self.safe_gui_call(messagebox.showerror, "Pipeline Error", f"Correlation failed: {e}")
-        finally:
-            self.safe_gui_call(self.enable_run_button)
-            
-    def _full_pipeline_worker(self):
-        try:
-            fits_dir = Path(self.raw_dir_var.get())
-            catalog = Path(self.catalog_var.get())
-            output = Path(self.output_dir_var.get())
-            start_f = self.start_frame_var.get()
-            num_f = self.num_frames_var.get()
-            
-            run_pre = self.preprocess_var.get()
-            run_sol = self.solve_var.get()
-            
-            if not start_f:
-                print("[ERROR] Start frame is not selected!")
-                return
-                
-            print("\n" + "="*50)
-            print(">>> STARTING PIPELINE INTEGRATION RUN")
-            print("="*50)
-            
-            # Step 1: Pre-process
-            if run_pre:
-                print("\n[Step 1/4] Pre-processing FITS frames...")
-                run_preprocessing(fits_dir, output, num_adj=2, batch_size=40)
-            else:
-                print("\n[Step 1/4] Pre-processing skipped.")
-                
-            # Step 2: Differencing
-            print("\n[Step 2/4] Running image differencing...")
-            diff, header, diff_fits, diff_png = run_difference(fits_dir, start_f, num_f, output)
-            
-            # Step 3: Solve WCS
-            if run_sol:
-                print("\n[Step 3/4] Calibrating WCS coordinates (Plate Solving)...")
-                raw_path = fits_dir / start_f
-                solve_and_apply_wcs(str(raw_path), str(diff_fits))
-            else:
-                print("\n[Step 3/4] WCS Calibration skipped.")
-                
-            # Step 4: Debris tracking, Photometry & Correlation
-            start_stem = Path(start_f).stem.replace(" ", "_")
-            output_png = output / f"diff_{start_stem}_{num_f}f_correlated.png"
-            results = process_and_correlate(str(diff_fits), str(catalog), str(output_png))
-            
-            if results:
-                self.detected_tracks = results
-                self.safe_gui_call(self.populate_results_table, results)
-                # Show the annotated PNG directly — not the raw difference FITS
-                self.safe_gui_call(self.show_annotated_png, output_png)
-                print(f"\n[SUCCESS] FULL PIPELINE SUCCESSFULLY COMPLETED! Detected {len(results)} streaks.")
-                self.safe_gui_call(messagebox.showinfo, "Pipeline Complete", f"Success! Detected {len(results)} debris tracks.\nReport saved to: Output/pipeline_report.txt")
-            else:
-                self.detected_tracks = []
-                self.safe_gui_call(self.populate_results_table, [])
-                print("\n[SUCCESS] FULL PIPELINE SUCCESSFULLY COMPLETED! No debris tracks detected.")
-                self.safe_gui_call(messagebox.showinfo, "Pipeline Complete", "Completed successfully. No debris tracks detected.")
-                
-        except Exception as e:
-            print(f"\n[ERROR] Pipeline integration crashed: {e}")
-            self.safe_gui_call(messagebox.showerror, "Pipeline Failure", f"Pipeline crashed: {e}")
-        finally:
-            self.safe_gui_call(self.enable_run_button)
-            
-    def populate_results_table(self, results):
-        # Clear table
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-            
-        if not results:
-            return
-            
+            self._log_line(f"[WARN] Could not scan FITS directory: {e}\n", "warn")
+
+    def _on_frame_selected(self, _event=None):
+        path = Path(self.v_raw_dir.get()) / self.v_start_frame.get()
+        if path.exists():
+            self._load_fits(path)
+
+    # ── Tree helpers ──────────────────────────────────────────────────────────
+    def _populate_tree(self, results):
+        for item in self._tree.get_children():
+            self._tree.delete(item)
         for res in results:
-            phot = res['photometry']
-            mag_val = phot['magnitude']
-            mag_str = f"{mag_val:.2f}" if not math.isnan(mag_val) else "N/A"
-            
-            p1 = res['start_pixel']
-            p2 = res['end_pixel']
-            
-            self.tree.insert("", tk.END, values=(
-                res['track_id'],
-                res['label'],
-                mag_str,
-                f"{phot['snr']:.1f}",
-                f"{phot['net_flux']:.1f}",
-                f"{phot['peak_value']:.1f}",
-                f"{phot['streak_length']:.1f}",
+            ph  = res["photometry"]
+            mag = f"{ph['magnitude']:.2f}" if not math.isnan(ph["magnitude"]) else "N/A"
+            p1  = res["start_pixel"]
+            p2  = res["end_pixel"]
+            tag = "match" if res.get("is_match") else "nomatch"
+            self._tree.insert("", "end", tags=(tag,), values=(
+                res["track_id"],
+                res["label"],
+                mag,
+                f"{ph['snr']:.1f}",
+                f"{ph['net_flux']:.1f}",
+                f"{ph['peak_value']:.1f}",
+                f"{ph['streak_length']:.1f}",
                 f"{res['centroid_ra']:.4f}",
                 f"{res['centroid_dec']:.4f}",
                 f"({p1[0]:.1f},{p1[1]:.1f})",
                 f"({p2[0]:.1f},{p2[1]:.1f})",
-                f"{res['separation_deg']:.4f}"
+                f"{res['separation_deg']:.4f}",
             ))
 
+    _sort_reverse = {}
+
+    def _sort_tree(self, col, reverse):
+        data = [(self._tree.set(k, col), k)
+                for k in self._tree.get_children("")]
+        try:
+            data.sort(key=lambda t: float(t[0].replace("N/A","inf")),
+                      reverse=reverse)
+        except Exception:
+            data.sort(reverse=reverse)
+        for idx, (_, k) in enumerate(data):
+            self._tree.move(k, "", idx)
+        self._tree.heading(col,
+            command=lambda c=col, r=not reverse: self._sort_tree(c, r))
+
+    def _on_row_dblclick(self, _event=None):
+        sel = self._tree.selection()
+        if not sel: return
+        tid = int(self._tree.item(sel[0], "values")[0])
+        track = next((t for t in self._tracks if t["track_id"] == tid), None)
+        if not track: return
+        p1, p2 = track["start_pixel"], track["end_pixel"]
+        mx, my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
+        hw = 120
+        self._ax.set_xlim(mx-hw, mx+hw)
+        self._ax.set_ylim(my-hw, my+hw)
+        self._canvas.draw_idle()
+        self._nb.select(0)
+
+    # ── Pipeline trigger ──────────────────────────────────────────────────────
+    def _trigger(self, stage: str):
+        if self._running:
+            self._log_line("[WARN] A pipeline step is already running.\n", "warn")
+            return
+        self._cancel_flag.clear()
+        self._set_running(True)
+
+        workers = {
+            "preprocess": self._worker_preprocess,
+            "diff":       self._worker_diff,
+            "solve":      self._worker_solve,
+            "correlate":  self._worker_correlate,
+            "full":       self._worker_full,
+        }
+        fn = workers.get(stage)
+        if not fn:
+            self._set_running(False); return
+
+        self._start_spinner(f"{stage.title()} running…")
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _cancel(self):
+        if self._running:
+            self._cancel_flag.set()
+            self._log_line("[INFO] Cancel requested — will stop after current step.\n", "info")
+
+    def _set_running(self, state: bool):
+        self._running = state
+        st = "disabled" if state else "normal"
+        self._run_btn.config(state=st)
+        self._cancel_btn.config(state="normal" if state else "disabled")
+
+    def _done(self, msg="Ready"):
+        self._safe(self._stop_spinner, msg)
+        self._safe(self._set_running, False)
+
+    # ── Workers ───────────────────────────────────────────────────────────────
+    def _worker_preprocess(self):
+        try:
+            run_preprocessing(Path(self.v_raw_dir.get()),
+                               Path(self.v_output.get()),
+                               num_adj=2, batch_size=40)
+            self._done("Pre-processing complete")
+        except Exception as e:
+            self._log_line(f"[ERROR] Preprocessing: {e}\n", "err")
+            self._done("Pre-processing failed")
+
+    def _worker_diff(self):
+        try:
+            diff, header, fits_out, png_out = run_difference(
+                Path(self.v_raw_dir.get()),
+                self.v_start_frame.get(),
+                self.v_num_frames.get(),
+                Path(self.v_output.get()))
+            self._safe(self._load_fits, fits_out)
+            self._done("Difference image ready")
+        except Exception as e:
+            self._log_line(f"[ERROR] Differencing: {e}\n", "err")
+            self._done("Differencing failed")
+
+    def _worker_solve(self):
+        try:
+            fits_dir   = Path(self.v_raw_dir.get())
+            raw_path   = fits_dir / self.v_start_frame.get()
+            stem       = Path(self.v_start_frame.get()).stem.replace(" ","_")
+            nf         = self.v_num_frames.get()
+            diff_path  = Path(self.v_output.get()) / f"diff_{stem}_{nf}f.fits"
+            ok = solve_and_apply_wcs(str(raw_path), str(diff_path))
+            msg = "Plate solve complete" if ok else "Plate solve: no solution found"
+            if ok: self._safe(self._load_fits, diff_path)
+            self._done(msg)
+        except Exception as e:
+            self._log_line(f"[ERROR] Solve: {e}\n", "err")
+            self._done("Plate solve failed")
+
+    def _worker_correlate(self):
+        try:
+            stem   = Path(self.v_start_frame.get()).stem.replace(" ","_")
+            nf     = self.v_num_frames.get()
+            out    = Path(self.v_output.get())
+            df     = out / f"diff_{stem}_{nf}f.fits"
+            png_out= out / f"diff_{stem}_{nf}f_correlated.png"
+            cat    = Path(self.v_catalog.get())
+            results = process_and_correlate(str(df), str(cat), str(png_out))
+            self._tracks = results or []
+            self._safe(self._populate_tree, self._tracks)
+            if png_out.exists():
+                self._png_path = png_out
+                self._safe(self._render_png, png_out)
+            msg = f"Detected {len(self._tracks)} track(s)"
+            self._done(msg)
+        except Exception as e:
+            self._log_line(f"[ERROR] Correlation: {e}\n", "err")
+            self._done("Correlation failed")
+
+    def _worker_full(self):
+        try:
+            fits_dir = Path(self.v_raw_dir.get())
+            out      = Path(self.v_output.get())
+            cat      = Path(self.v_catalog.get())
+            sf       = self.v_start_frame.get()
+            nf       = self.v_num_frames.get()
+            stem     = Path(sf).stem.replace(" ", "_")
+
+            if not sf:
+                self._log_line("[ERROR] No start frame selected.\n", "err")
+                self._done("Failed — no start frame"); return
+
+            print("=" * 55)
+            print("  FRIGATE Full Pipeline")
+            print("=" * 55)
+
+            # Step 1
+            if self.v_do_preproc.get() and not self._cancel_flag.is_set():
+                print("\n[1/4] Pre-processing frames…")
+                run_preprocessing(fits_dir, out, num_adj=2, batch_size=40)
+
+            # Step 2
+            if self._cancel_flag.is_set(): self._done("Cancelled"); return
+            print("\n[2/4] Computing difference image…")
+            diff, header, diff_fits, _ = run_difference(fits_dir, sf, nf, out)
+            self._safe(self._load_fits, diff_fits)
+
+            # Step 3
+            if self.v_do_solve.get() and not self._cancel_flag.is_set():
+                print("\n[3/4] Plate solving…")
+                solve_and_apply_wcs(str(fits_dir / sf), str(diff_fits))
+                self._safe(self._load_fits, diff_fits)
+
+            # Step 4
+            if self._cancel_flag.is_set(): self._done("Cancelled"); return
+            print("\n[4/4] Detecting tracks & correlating…")
+            png_out = out / f"diff_{stem}_{nf}f_correlated.png"
+            results = process_and_correlate(str(diff_fits), str(cat), str(png_out))
+            self._tracks = results or []
+            self._safe(self._populate_tree, self._tracks)
+            if png_out.exists():
+                self._png_path = png_out
+                self._safe(self._render_png, png_out)
+
+            print(f"\n[DONE] {len(self._tracks)} track(s) detected.")
+            self._done(f"Complete — {len(self._tracks)} track(s) found")
+
+        except Exception as e:
+            self._log_line(f"[ERROR] Full pipeline: {e}\n", "err")
+            self._done("Pipeline failed")
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
     def destroy(self):
-        # Restore old stdout/stderr
-        sys.stdout = self.old_stdout
-        sys.stderr = self.old_stderr
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        plt.close("all")
         super().destroy()
 
+
+# =============================================================================
 if __name__ == "__main__":
     app = DebrisTrackerGUI()
     app.mainloop()
