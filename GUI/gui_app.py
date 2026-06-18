@@ -1,34 +1,26 @@
 """
-gui.py — Space Debris Detection & Photometry Dashboard
-=======================================================
-Professional Tkinter GUI for the FRIGATE pipeline.
+gui.py — FRIGATE Space Debris Detection Dashboard
+===================================================
+Design language: deep-space observatory terminal.
+Palette: near-black (#0b0d12) + cold-blue accent (#3b82f6) + 
+         amber telemetry (#f59e0b) + success-green (#22c55e).
+Signature element: a real-time "TELEMETRY" status strip that pulses
+amber while any pipeline stage runs — zero CPU cost, pure label swap.
 
-Performance fixes vs original:
-  - Image cached as numpy array; stretch/cmap changes reuse cached data
-  - Matplotlib figure NOT recreated on every update — only image data replaced
-  - Motion-notify debounced (16ms throttle, ~60fps max)
-  - Log console: plain text insert, capped at 4000 lines, no state toggle per line
-  - Downsampling factor computed once on load, not every redraw
-  - Treeview: tag-based row colouring, incremental insert
-  - All messagebox calls routed through gui_queue (never from worker thread directly)
-  - Pipeline cancel flag (threading.Event) checked by workers
-  - Status bar with animated spinner during pipeline runs
-  - Keyboard shortcuts: F5=run all, Ctrl+L=clear log, Escape=cancel
+Performance over original:
+  - Matplotlib figure created ONCE; image data swapped in-place
+  - Mouse coords debounced at 16 ms (~60 fps cap)
+  - Log capped at 3000 lines, no state-toggle per write
+  - Downsampling factor fixed on image load
+  - All Tkinter calls from worker threads routed through gui_queue
+  - Cancel flag (threading.Event) honoured between pipeline stages
 """
 
-import gc
-import io
-import math
-import os
-import queue
-import sys
-import threading
-import time
+import gc, io, math, os, queue, sys, threading, time
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("TkAgg")
-
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -37,405 +29,429 @@ import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-try:
-    from PIL import Image, ImageTk
-    _PIL = True
-except ImportError:
-    _PIL = False
-
-# ── Pipeline imports (graceful degradation if modules missing) ────────────────
+# ── Pipeline imports ──────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).parent.parent
 CODE_DIR = ROOT_DIR / "Code"
 sys.path.extend([str(ROOT_DIR), str(CODE_DIR)])
 
-_IMPORT_ERROR = None
+_IMPORT_ERR = None
 try:
     from astropy.io import fits
     from astropy.wcs import WCS
     from pre_process import run_preprocessing, get_sorted_fits
-    from difference import run_difference
+    from difference  import run_difference
     from plate_solver import solve_and_apply_wcs
-    from correlate import process_and_correlate
-    from display import apply_stretch
+    from correlate   import process_and_correlate
+    from display     import apply_stretch
     from flux_extract import extract_streak_flux
 except ImportError as e:
-    _IMPORT_ERROR = str(e)
-    # Stub so the GUI still launches and shows the error
+    _IMPORT_ERR = str(e)
     def get_sorted_fits(d): return sorted(Path(d).glob("*.fits"))
     def apply_stretch(d, stretch_type="percentile"):
-        lo, hi = np.percentile(d, [2, 99])
-        return np.clip((d - lo) / max(hi - lo, 1), 0, 1)
-
+        lo, hi = np.percentile(d, [1, 99.5])
+        return np.clip((d - lo) / max(hi - lo, 1e-9), 0, 1)
 
 # =============================================================================
-# Palette & design tokens
+# Design tokens
 # =============================================================================
-# Inspired by deep-sky observatory dashboards: near-black with cold-blue
-# accent and amber for live data. One signature element: the status bar
-# uses a pulsing amber dot to show pipeline activity without blocking the UI.
-
-PAL = {
-    "bg":          "#0d0f14",   # near-black with blue tint
-    "surface":     "#13161e",   # card background
-    "surface2":    "#1a1e29",   # slightly lighter surface
-    "border":      "#252a38",   # subtle border
-    "accent":      "#4d9de0",   # cold blue — primary action
-    "accent_dim":  "#2a5580",   # muted blue for inactive
-    "amber":       "#e8a838",   # live data / warning
-    "green":       "#3dd68c",   # success / correlated
-    "red":         "#e05d5d",   # error / uncorrelated
-    "fg":          "#d8dce8",   # primary text
-    "fg_dim":      "#6b7394",   # secondary text
-    "mono":        "Consolas",  # monospace
-    "ui":          "Segoe UI",  # UI font
+C = {
+    # backgrounds
+    "bg0":      "#0b0d12",   # root
+    "bg1":      "#10131a",   # panels
+    "bg2":      "#161b26",   # cards / inputs
+    "bg3":      "#1e2535",   # hover / selected
+    # borders
+    "brd":      "#252d3d",
+    "brd2":     "#2f3a50",
+    # accent
+    "blue":     "#3b82f6",
+    "blue_dim": "#1e3a5f",
+    "amber":    "#f59e0b",
+    "amber_dim":"#4a3000",
+    "green":    "#22c55e",
+    "green_dim":"#0d3320",
+    "red":      "#ef4444",
+    "red_dim":  "#3b1010",
+    # text
+    "fg0":      "#e2e8f0",   # primary
+    "fg1":      "#94a3b8",   # secondary
+    "fg2":      "#4b5880",   # muted
+    # mono
+    "mono_fg":  "#4ade80",   # console green
 }
 
-FONT_UI    = (PAL["ui"],   10)
-FONT_UI_B  = (PAL["ui"],   10, "bold")
-FONT_TITLE = (PAL["ui"],   11, "bold")
-FONT_MONO  = (PAL["mono"],  9)
-FONT_SMALL = (PAL["ui"],    9)
+# Fonts
+FN  = "Segoe UI"
+FNM = "Consolas"
+F   = lambda sz, w="normal": (FN,  sz, w)
+FM  = lambda sz: (FNM, sz)
+
+LOG_MAX = 3000
 
 
 # =============================================================================
 # Thread-safe logger
 # =============================================================================
-
-class _Logger:
-    """
-    Writes to a queue; the main thread drains it into the Text widget.
-    Never touches Tkinter from a worker thread.
-    """
-    MAX_LINES = 4000
-
-    def __init__(self, q: queue.Queue, original=None):
-        self._q        = q
-        self._original = original
-
+class _SafeWriter:
+    def __init__(self, q, orig=None):
+        self._q = q; self._orig = orig
     def write(self, s):
         self._q.put(("log", s))
-        if self._original:
-            self._original.write(s)
-
+        if self._orig:
+            self._orig.write(s)
     def flush(self):
-        if self._original:
-            try: self._original.flush()
-            except Exception: pass
+        if self._orig:
+            try: self._orig.flush()
+            except: pass
+
+
+# =============================================================================
+# Reusable widget helpers
+# =============================================================================
+def _sep(parent, orient="h", **kw):
+    if orient == "h":
+        tk.Frame(parent, bg=C["brd"], height=1, **kw).pack(fill="x")
+    else:
+        tk.Frame(parent, bg=C["brd"], width=1, **kw).pack(fill="y", side="left")
+
+def _label(parent, text, color=None, font=None, **kw):
+    return tk.Label(parent, text=text,
+                    bg=kw.pop("bg", C["bg1"]),
+                    fg=color or C["fg1"],
+                    font=font or F(9), **kw)
+
+def _badge(parent, text, bg, fg):
+    f = tk.Frame(parent, bg=bg, padx=6, pady=1)
+    tk.Label(f, text=text, bg=bg, fg=fg, font=F(8, "bold")).pack()
+    return f
+
+def _icon_btn(parent, text, cmd, bg=None, fg=None, width=None):
+    kw = dict(text=text, command=cmd,
+              bg=bg or C["bg2"], fg=fg or C["fg0"],
+              activebackground=C["bg3"], activeforeground=C["fg0"],
+              font=F(9), relief="flat", cursor="hand2",
+              bd=0, highlightthickness=0, padx=10, pady=5)
+    if width: kw["width"] = width
+    return tk.Button(parent, **kw)
+
+def _entry(parent, var, **kw):
+    e = tk.Entry(parent, textvariable=var,
+                 bg=C["bg2"], fg=C["fg0"],
+                 insertbackground=C["fg0"],
+                 relief="flat", font=F(9),
+                 highlightthickness=1,
+                 highlightbackground=C["brd"],
+                 highlightcolor=C["blue"], **kw)
+    return e
+
+def _combo(parent, var, values, width=14):
+    cb = ttk.Combobox(parent, textvariable=var, values=values,
+                      state="readonly", width=width, font=F(9))
+    return cb
+
+def _spin(parent, var, lo, hi, width=7):
+    s = ttk.Spinbox(parent, from_=lo, to=hi, textvariable=var,
+                    width=width, font=F(9))
+    return s
 
 
 # =============================================================================
 # Main application
 # =============================================================================
+class FrigateGUI(tk.Tk):
 
-class DebrisTrackerGUI(tk.Tk):
-
-    # ── init ─────────────────────────────────────────────────────────────────
+    # ── init ──────────────────────────────────────────────────────────────────
     def __init__(self):
         super().__init__()
-        self.title("FRIGATE — Space Debris Detection & Photometry")
-        self.geometry("1400x860")
-        self.minsize(1100, 720)
-        self.configure(bg=PAL["bg"])
+        self.title("FRIGATE  ·  Space Debris Detection")
+        self.geometry("1480x900")
+        self.minsize(1100, 700)
+        self.configure(bg=C["bg0"])
+        self._apply_ttk_styles()
 
         # State
-        self._fits_data     = None      # raw float32 array, cached on load
-        self._fits_header   = None
-        self._fits_wcs      = None
-        self._fits_path     = None
-        self._display_cache = None      # (stretch, cmap) → scaled uint8
-        self._display_key   = None
-        self._ds_factor     = 1         # downsampling, computed once on load
-        self._png_path      = None
-        self._tracks        = []
-        self._cancel_flag   = threading.Event()
-        self._running       = False
-        self._motion_after  = None      # debounce id for mouse move
-        self._spinner_after = None
-        self._spinner_idx   = 0
-
-        # Queues
-        self._log_q  = queue.Queue()
-        self._gui_q  = queue.Queue()
+        self._fits_data   = None
+        self._fits_hdr    = None
+        self._fits_wcs    = None
+        self._fits_path   = None
+        self._ds          = 1
+        self._cache_arr   = None
+        self._cache_key   = None
+        self._im          = None      # single AxesImage kept alive
+        self._png_path    = None
+        self._tracks      = []
+        self._running     = False
+        self._cancel      = threading.Event()
+        self._motion_id   = None
+        self._spin_id     = None
+        self._spin_i      = 0
 
         # Variables
-        self.v_raw_dir     = tk.StringVar(value=str(ROOT_DIR / "Data" / "raw"))
-        self.v_catalog     = tk.StringVar(value=str(ROOT_DIR / "Data" / "3le.txt"))
-        self.v_output      = tk.StringVar(value=str(ROOT_DIR / "Output"))
-        self.v_start_frame = tk.StringVar()
-        self.v_num_frames  = tk.IntVar(value=10)
-        self.v_do_preproc  = tk.BooleanVar(value=False)
-        self.v_do_solve    = tk.BooleanVar(value=True)
-        self.v_show_ann    = tk.BooleanVar(value=True)
-        self.v_stretch     = tk.StringVar(value="percentile")
-        self.v_cmap        = tk.StringVar(value="gray")
-        self.v_status      = tk.StringVar(value="Ready")
+        self.v_raw    = tk.StringVar(value=str(ROOT_DIR / "Data" / "raw"))
+        self.v_cat    = tk.StringVar(value=str(ROOT_DIR / "Data" / "3le.txt"))
+        self.v_out    = tk.StringVar(value=str(ROOT_DIR / "Output"))
+        self.v_frame  = tk.StringVar()
+        self.v_nf     = tk.IntVar(value=10)
+        self.v_preproc= tk.BooleanVar(value=False)
+        self.v_solve  = tk.BooleanVar(value=True)
+        self.v_ann    = tk.BooleanVar(value=True)
+        self.v_stretch= tk.StringVar(value="percentile")
+        self.v_cmap   = tk.StringVar(value="gray")
+        self.v_status = tk.StringVar(value="IDLE")
 
-        self._build_styles()
-        self._build_ui()
-        self._scan_raw_dir()
+        # Queues
+        self._log_q = queue.Queue()
+        self._gui_q = queue.Queue()
 
-        # Keyboard shortcuts
-        self.bind("<F5>",         lambda e: self._trigger("full"))
-        self.bind("<Control-l>",  lambda e: self._clear_log())
-        self.bind("<Escape>",     lambda e: self._cancel())
+        self._build()
+        self._scan_fits()
 
-        # Redirect stdout/stderr
-        self._orig_stdout = sys.stdout
-        self._orig_stderr = sys.stderr
-        sys.stdout = _Logger(self._log_q, self._orig_stdout)
-        sys.stderr = _Logger(self._log_q, self._orig_stderr)
+        # Keyboard
+        self.bind("<F5>",        lambda e: self._run("full"))
+        self.bind("<Control-l>", lambda e: self._clear_log())
+        self.bind("<Escape>",    lambda e: self._do_cancel())
 
-        # Drain queues
-        self.after(80,  self._drain_log_q)
-        self.after(50,  self._drain_gui_q)
+        # Redirect output
+        self._out0 = sys.stdout; self._err0 = sys.stderr
+        sys.stdout = _SafeWriter(self._log_q, self._out0)
+        sys.stderr = _SafeWriter(self._log_q, self._err0)
 
-        # Show import error if any
-        if _IMPORT_ERROR:
-            self.after(200, lambda: self._log_line(
-                f"[WARN] Some pipeline modules failed to import: {_IMPORT_ERROR}\n"
-                f"       GUI is functional but pipeline steps may fail.\n"
-            ))
+        self.after(80,  self._poll_log)
+        self.after(50,  self._poll_gui)
 
-        self._log_line("FRIGATE pipeline GUI ready.  F5 = Run Full | Ctrl+L = Clear log | Esc = Cancel\n")
+        if _IMPORT_ERR:
+            self.after(300, lambda: print(f"[WARN] Import error: {_IMPORT_ERR}"))
+        print("FRIGATE ready.   F5 = full pipeline   Ctrl+L = clear log   Esc = cancel\n")
 
-    # ── styles ────────────────────────────────────────────────────────────────
-    def _build_styles(self):
+    # ── TTK styles ────────────────────────────────────────────────────────────
+    def _apply_ttk_styles(self):
         s = ttk.Style()
         s.theme_use("clam")
+        bg0, bg1, bg2 = C["bg0"], C["bg1"], C["bg2"]
+        fg0, fg1, fg2 = C["fg0"], C["fg1"], C["fg2"]
+        brd = C["brd"]
+        blue = C["blue"]
 
-        s.configure(".",
-            background=PAL["surface"], foreground=PAL["fg"],
-            font=FONT_UI, borderwidth=0, relief="flat")
-
-        s.configure("TLabel",
-            background=PAL["surface"], foreground=PAL["fg"], font=FONT_UI)
-
-        s.configure("Dim.TLabel",
-            background=PAL["surface"], foreground=PAL["fg_dim"], font=FONT_SMALL)
-
-        s.configure("Title.TLabel",
-            background=PAL["surface"], foreground=PAL["accent"], font=FONT_TITLE)
-
-        s.configure("TFrame", background=PAL["surface"])
-        s.configure("Sep.TFrame", background=PAL["border"])
-
-        s.configure("TButton",
-            background=PAL["accent"], foreground="#ffffff",
-            font=FONT_UI_B, padding=(10, 5), relief="flat")
-        s.map("TButton",
-            background=[("active","#6ab4f0"),("disabled", PAL["accent_dim"])],
-            foreground=[("disabled","#8899aa")])
-
-        s.configure("Ghost.TButton",
-            background=PAL["surface2"], foreground=PAL["fg"],
-            font=FONT_UI, padding=(8, 4))
-        s.map("Ghost.TButton",
-            background=[("active", PAL["border"])])
-
-        s.configure("Danger.TButton",
-            background="#5c2020", foreground=PAL["red"],
-            font=FONT_UI_B, padding=(10,5))
-        s.map("Danger.TButton",
-            background=[("active","#7a2a2a")])
-
-        s.configure("TEntry",
-            fieldbackground=PAL["bg"], foreground=PAL["fg"],
-            insertcolor=PAL["fg"], bordercolor=PAL["border"],
-            lightcolor=PAL["border"], darkcolor=PAL["border"])
-
-        s.configure("TCombobox",
-            fieldbackground=PAL["bg"], background=PAL["surface2"],
-            foreground=PAL["fg"], arrowcolor=PAL["accent"],
-            bordercolor=PAL["border"])
-        s.map("TCombobox", fieldbackground=[("readonly", PAL["bg"])])
-
-        s.configure("TSpinbox",
-            fieldbackground=PAL["bg"], foreground=PAL["fg"],
-            arrowcolor=PAL["accent"], bordercolor=PAL["border"])
-
-        s.configure("TCheckbutton",
-            background=PAL["surface"], foreground=PAL["fg"],
-            font=FONT_UI, indicatorcolor=PAL["bg"],
-            indicatordiameter=14)
-        s.map("TCheckbutton",
-            indicatorcolor=[("selected", PAL["accent"]),
-                            ("!selected", PAL["border"])])
-
-        s.configure("TNotebook",
-            background=PAL["bg"], borderwidth=0, tabmargins=0)
-        s.configure("TNotebook.Tab",
-            background=PAL["surface"], foreground=PAL["fg_dim"],
-            font=FONT_UI, padding=[16, 6])
-        s.map("TNotebook.Tab",
-            background=[("selected", PAL["bg"])],
-            foreground=[("selected", PAL["accent"])])
-
-        s.configure("Treeview",
-            background=PAL["surface"], fieldbackground=PAL["surface"],
-            foreground=PAL["fg"], rowheight=26, font=FONT_SMALL,
-            borderwidth=0)
-        s.configure("Treeview.Heading",
-            background=PAL["bg"], foreground=PAL["fg_dim"],
-            font=FONT_UI_B, relief="flat", padding=(4,4))
-        s.map("Treeview",
-            background=[("selected", PAL["accent_dim"])],
-            foreground=[("selected", "#ffffff")])
-
-        s.configure("TLabelframe",
-            background=PAL["surface"], foreground=PAL["fg_dim"],
-            bordercolor=PAL["border"], font=FONT_SMALL)
-        s.configure("TLabelframe.Label",
-            background=PAL["surface"], foreground=PAL["fg_dim"],
-            font=FONT_SMALL)
+        s.configure(".", background=bg1, foreground=fg0,
+                    font=F(9), borderwidth=0, relief="flat",
+                    troughcolor=bg0, selectbackground=C["blue_dim"],
+                    selectforeground=fg0)
 
         s.configure("TScrollbar",
-            background=PAL["surface2"], troughcolor=PAL["bg"],
-            arrowcolor=PAL["fg_dim"], borderwidth=0)
+                    background=bg2, troughcolor=bg0,
+                    arrowcolor=fg2, gripcount=0,
+                    relief="flat", borderwidth=0)
 
-        # Progress / status bar
-        s.configure("Status.TLabel",
-            background=PAL["bg"], foreground=PAL["fg_dim"], font=FONT_SMALL)
+        s.configure("TCombobox",
+                    fieldbackground=bg2, background=bg2,
+                    foreground=fg0, arrowcolor=blue,
+                    bordercolor=brd, lightcolor=brd, darkcolor=brd,
+                    insertcolor=fg0)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", bg2)],
+              selectbackground=[("readonly", bg2)],
+              selectforeground=[("readonly", fg0)])
 
-    # ── UI construction ───────────────────────────────────────────────────────
-    def _build_ui(self):
-        # Root grid: left sidebar | right workspace
+        s.configure("TSpinbox",
+                    fieldbackground=bg2, foreground=fg0,
+                    arrowcolor=blue, bordercolor=brd,
+                    lightcolor=brd, darkcolor=brd)
+
+        s.configure("TCheckbutton",
+                    background=bg1, foreground=fg0,
+                    indicatorcolor=bg2, indicatordiameter=15)
+        s.map("TCheckbutton",
+              indicatorcolor=[("selected", blue), ("!selected", brd)])
+
+        s.configure("TLabelframe",
+                    background=bg1, bordercolor=brd)
+        s.configure("TLabelframe.Label",
+                    background=bg1, foreground=fg2, font=F(8))
+
+        s.configure("Treeview",
+                    background=bg1, fieldbackground=bg1,
+                    foreground=fg0, rowheight=26, font=F(9),
+                    borderwidth=0)
+        s.configure("Treeview.Heading",
+                    background=bg0, foreground=fg2,
+                    font=F(9, "bold"), relief="flat", padding=(6,4))
+        s.map("Treeview",
+              background=[("selected", C["blue_dim"])],
+              foreground=[("selected", C["fg0"])])
+
+        # Option menu dropdown colours
+        self.option_add("*TCombobox*Listbox.background",    bg2)
+        self.option_add("*TCombobox*Listbox.foreground",    fg0)
+        self.option_add("*TCombobox*Listbox.selectBackground", C["blue_dim"])
+        self.option_add("*TCombobox*Listbox.selectForeground", fg0)
+        self.option_add("*TCombobox*Listbox.font",          F(9))
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+    def _build(self):
+        # Root grid: topbar | (sidebar | workspace) | statusbar
+        self.rowconfigure(1, weight=1)
         self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
-        self.rowconfigure(1, weight=0)
 
+        self._build_topbar()
         self._build_sidebar()
         self._build_workspace()
         self._build_statusbar()
 
+    # ── Top bar ───────────────────────────────────────────────────────────────
+    def _build_topbar(self):
+        bar = tk.Frame(self, bg=C["bg1"], height=48)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        bar.grid_propagate(False)
+
+        # Logo mark
+        logo = tk.Frame(bar, bg=C["bg1"])
+        logo.pack(side="left", padx=(16, 0))
+        tk.Label(logo, text="FRIGATE", bg=C["bg1"], fg=C["blue"],
+                 font=(FN, 15, "bold")).pack(side="left")
+        tk.Label(logo, text=" / space debris detection",
+                 bg=C["bg1"], fg=C["fg2"], font=F(10)).pack(side="left")
+
+        # Right cluster: telemetry badge + keyboard hint
+        right = tk.Frame(bar, bg=C["bg1"])
+        right.pack(side="right", padx=16)
+
+        tk.Label(right, text="F5 run · Ctrl+L log · Esc cancel",
+                 bg=C["bg1"], fg=C["fg2"], font=F(8)).pack(side="right", padx=(12,0))
+
+        self._telem_frame = tk.Frame(right, bg=C["amber_dim"],
+                                      padx=10, pady=4)
+        self._telem_frame.pack(side="right")
+        self._telem_lbl = tk.Label(self._telem_frame,
+                                    text="● IDLE",
+                                    bg=C["amber_dim"], fg=C["amber"],
+                                    font=F(9, "bold"))
+        self._telem_lbl.pack()
+
+        # Thin bottom border
+        tk.Frame(bar, bg=C["brd"], height=1).pack(side="bottom", fill="x")
+
     # ── Sidebar ───────────────────────────────────────────────────────────────
     def _build_sidebar(self):
-        sb = tk.Frame(self, bg=PAL["surface"], width=300)
-        sb.grid(row=0, column=0, sticky="nsew", padx=(0,1))
+        sb = tk.Frame(self, bg=C["bg1"], width=290)
+        sb.grid(row=1, column=0, sticky="nsew")
         sb.grid_propagate(False)
         sb.columnconfigure(0, weight=1)
 
-        # Header
-        hdr = tk.Frame(sb, bg=PAL["surface"])
-        hdr.grid(row=0, column=0, sticky="ew", pady=(16,8), padx=16)
-        tk.Label(hdr, text="FRIGATE", bg=PAL["surface"],
-                 fg=PAL["accent"], font=(PAL["ui"], 16, "bold")).pack(anchor="w")
-        tk.Label(hdr, text="Debris Detection Pipeline",
-                 bg=PAL["surface"], fg=PAL["fg_dim"], font=FONT_SMALL).pack(anchor="w")
-
-        # Thin divider
-        tk.Frame(sb, bg=PAL["border"], height=1).grid(row=1, column=0, sticky="ew")
-
-        # Scrollable content
-        canvas = tk.Canvas(sb, bg=PAL["surface"], highlightthickness=0, bd=0)
+        # Scrollable inner
+        canvas = tk.Canvas(sb, bg=C["bg1"], highlightthickness=0, bd=0)
         vsb    = ttk.Scrollbar(sb, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
+        vsb.grid(row=0, column=1, sticky="ns")
+        canvas.grid(row=0, column=0, sticky="nsew")
+        sb.rowconfigure(0, weight=1)
 
-        vsb.grid(row=2, column=1, sticky="ns")
-        canvas.grid(row=2, column=0, sticky="nsew")
-        sb.rowconfigure(2, weight=1)
+        inner = tk.Frame(canvas, bg=C["bg1"])
+        wid   = canvas.create_window((0,0), window=inner, anchor="nw")
 
-        inner = tk.Frame(canvas, bg=PAL["surface"])
-        win_id = canvas.create_window((0,0), window=inner, anchor="nw")
+        def _resize(e): canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _resize)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(wid, width=e.width))
 
-        def _on_inner_resize(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(win_id, width=canvas.winfo_width())
-        inner.bind("<Configure>", _on_inner_resize)
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+        def _scroll(e): canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _scroll))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
-        def _scroll(e):  canvas.yview_scroll(int(-1*(e.delta/120)), "units")
-        canvas.bind("<Enter>",  lambda e: canvas.bind_all("<MouseWheel>", _scroll))
-        canvas.bind("<Leave>",  lambda e: canvas.unbind_all("<MouseWheel>"))
+        self._build_sb_paths(inner)
+        self._build_sb_params(inner)
+        self._build_sb_actions(inner)
 
-        p = 16  # padding
-        self._build_section_paths(inner, p)
-        self._build_section_params(inner, p)
-        self._build_section_actions(inner, p)
+    def _sec(self, parent, title):
+        """Section header row."""
+        f = tk.Frame(parent, bg=C["bg1"])
+        f.pack(fill="x", padx=14, pady=(18, 6))
+        tk.Label(f, text=title.upper(), bg=C["bg1"],
+                 fg=C["blue"], font=F(8, "bold")).pack(side="left")
+        tk.Frame(f, bg=C["brd2"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(8,0), pady=1)
 
-    def _section_label(self, parent, text):
-        f = tk.Frame(parent, bg=PAL["surface"])
-        f.pack(fill="x", padx=16, pady=(18,4))
-        tk.Label(f, text=text.upper(), bg=PAL["surface"],
-                 fg=PAL["fg_dim"], font=(PAL["ui"], 8, "bold")).pack(side="left")
-        tk.Frame(f, bg=PAL["border"], height=1).pack(side="left", fill="x",
-                                                      expand=True, padx=(8,0))
+    def _path_row(self, parent, label, var, browse):
+        tk.Label(parent, text=label, bg=C["bg1"],
+                 fg=C["fg2"], font=F(8)).pack(anchor="w", padx=14, pady=(4,1))
+        row = tk.Frame(parent, bg=C["bg1"])
+        row.pack(fill="x", padx=14, pady=(0,4))
+        _entry(row, var).pack(side="left", fill="x", expand=True)
+        _icon_btn(row, "…", browse, bg=C["bg2"], fg=C["fg1"], width=3
+                  ).pack(side="left", padx=(3,0))
 
-    def _path_row(self, parent, label, var, browse_cmd):
-        tk.Label(parent, text=label, bg=PAL["surface"],
-                 fg=PAL["fg_dim"], font=FONT_SMALL).pack(
-                     anchor="w", padx=16, pady=(6,1))
-        row = tk.Frame(parent, bg=PAL["surface"])
-        row.pack(fill="x", padx=16, pady=(0,2))
-        ttk.Entry(row, textvariable=var, font=FONT_SMALL).pack(
-            side="left", fill="x", expand=True)
-        ttk.Button(row, text="…", width=3,
-                   style="Ghost.TButton",
-                   command=browse_cmd).pack(side="left", padx=(4,0))
+    def _build_sb_paths(self, p):
+        self._sec(p, "Directories")
+        self._path_row(p, "Raw FITS folder", self.v_raw, self._browse_raw)
+        self._path_row(p, "TLE catalogue",   self.v_cat, self._browse_cat)
+        self._path_row(p, "Output folder",   self.v_out, self._browse_out)
 
-    def _build_section_paths(self, parent, p):
-        self._section_label(parent, "Directories")
-        self._path_row(parent, "Raw FITS folder",
-                       self.v_raw_dir, self._browse_raw)
-        self._path_row(parent, "TLE catalogue file",
-                       self.v_catalog, self._browse_catalog)
-        self._path_row(parent, "Output directory",
-                       self.v_output, self._browse_output)
+    def _build_sb_params(self, p):
+        self._sec(p, "Parameters")
 
-    def _build_section_params(self, parent, p):
-        self._section_label(parent, "Parameters")
+        tk.Label(p, text="Start frame", bg=C["bg1"],
+                 fg=C["fg2"], font=F(8)).pack(anchor="w", padx=14, pady=(2,1))
+        self._frame_cb = _combo(p, self.v_frame, [], width=22)
+        self._frame_cb.pack(fill="x", padx=14, pady=(0,6))
+        self._frame_cb.bind("<<ComboboxSelected>>", self._on_frame)
 
-        tk.Label(parent, text="Start frame", bg=PAL["surface"],
-                 fg=PAL["fg_dim"], font=FONT_SMALL).pack(anchor="w", padx=16, pady=(6,1))
-        self._frame_combo = ttk.Combobox(parent, textvariable=self.v_start_frame,
-                                          state="readonly", font=FONT_SMALL)
-        self._frame_combo.pack(fill="x", padx=16, pady=(0,6))
-        self._frame_combo.bind("<<ComboboxSelected>>", self._on_frame_selected)
+        tk.Label(p, text="Number of frames", bg=C["bg1"],
+                 fg=C["fg2"], font=F(8)).pack(anchor="w", padx=14, pady=(2,1))
+        _spin(p, self.v_nf, 3, 500).pack(anchor="w", padx=14, pady=(0,8))
 
-        tk.Label(parent, text="Number of frames", bg=PAL["surface"],
-                 fg=PAL["fg_dim"], font=FONT_SMALL).pack(anchor="w", padx=16, pady=(2,1))
-        ttk.Spinbox(parent, from_=3, to=500, textvariable=self.v_num_frames,
-                    width=8, font=FONT_SMALL).pack(anchor="w", padx=16, pady=(0,6))
+        # Options
+        opt = tk.Frame(p, bg=C["bg1"])
+        opt.pack(fill="x", padx=14, pady=(0,4))
+        ttk.Checkbutton(opt, text="Pre-process frames",
+                        variable=self.v_preproc).pack(anchor="w", pady=2)
+        ttk.Checkbutton(opt, text="Run plate solver (WCS)",
+                        variable=self.v_solve).pack(anchor="w", pady=2)
 
-        opt_frame = tk.Frame(parent, bg=PAL["surface"])
-        opt_frame.pack(fill="x", padx=16, pady=(2,6))
-        ttk.Checkbutton(opt_frame, text="Pre-process frames",
-                        variable=self.v_do_preproc).pack(anchor="w", pady=2)
-        ttk.Checkbutton(opt_frame, text="Run plate solver (WCS)",
-                        variable=self.v_do_solve).pack(anchor="w", pady=2)
+    def _build_sb_actions(self, p):
+        self._sec(p, "Pipeline")
 
-    def _build_section_actions(self, parent, p):
-        self._section_label(parent, "Actions")
-
-        actions = [
-            ("Pre-process only",    "preprocess", "Ghost.TButton"),
-            ("Difference image",    "diff",       "Ghost.TButton"),
-            ("Plate solve",         "solve",      "Ghost.TButton"),
-            ("Detect & correlate",  "correlate",  "Ghost.TButton"),
+        steps = [
+            ("Pre-process",        "preprocess"),
+            ("Difference image",   "diff"),
+            ("Plate solve",        "solve"),
+            ("Detect & correlate", "correlate"),
         ]
-        btn_frame = tk.Frame(parent, bg=PAL["surface"])
-        btn_frame.pack(fill="x", padx=16, pady=(0,8))
-        for label, cmd, style in actions:
-            ttk.Button(btn_frame, text=label, style=style,
-                       command=lambda c=cmd: self._trigger(c)).pack(
-                           fill="x", pady=2)
+        step_frame = tk.Frame(p, bg=C["bg1"])
+        step_frame.pack(fill="x", padx=14, pady=(0,4))
+        for label, cmd in steps:
+            btn = _icon_btn(step_frame, label,
+                            lambda c=cmd: self._run(c),
+                            bg=C["bg2"], fg=C["fg1"])
+            btn.pack(fill="x", pady=2)
 
-        tk.Frame(parent, bg=PAL["border"], height=1).pack(
-            fill="x", padx=16, pady=8)
+        tk.Frame(p, bg=C["brd"], height=1).pack(fill="x", padx=14, pady=10)
 
-        self._run_btn = ttk.Button(parent, text="RUN FULL PIPELINE  [F5]",
-                                    command=lambda: self._trigger("full"))
-        self._run_btn.pack(fill="x", padx=16, pady=(0,4))
+        # Primary CTA
+        self._run_btn = tk.Button(p, text="RUN FULL PIPELINE",
+                                   command=lambda: self._run("full"),
+                                   bg=C["blue"], fg="#ffffff",
+                                   activebackground="#60a5fa",
+                                   activeforeground="#ffffff",
+                                   font=F(10, "bold"),
+                                   relief="flat", cursor="hand2",
+                                   bd=0, highlightthickness=0,
+                                   pady=9)
+        self._run_btn.pack(fill="x", padx=14, pady=(0,4))
 
-        self._cancel_btn = ttk.Button(parent, text="Cancel  [Esc]",
-                                       style="Danger.TButton",
-                                       command=self._cancel,
-                                       state="disabled")
-        self._cancel_btn.pack(fill="x", padx=16, pady=(0,16))
+        self._cancel_btn = tk.Button(p, text="Cancel",
+                                      command=self._do_cancel,
+                                      bg=C["red_dim"], fg=C["red"],
+                                      activebackground="#4a1515",
+                                      activeforeground=C["red"],
+                                      font=F(9),
+                                      relief="flat", cursor="hand2",
+                                      bd=0, highlightthickness=0,
+                                      pady=6, state="disabled")
+        self._cancel_btn.pack(fill="x", padx=14, pady=(0,20))
 
     # ── Workspace ─────────────────────────────────────────────────────────────
     def _build_workspace(self):
-        ws = tk.Frame(self, bg=PAL["bg"])
-        ws.grid(row=0, column=1, sticky="nsew")
+        ws = tk.Frame(self, bg=C["bg0"])
+        ws.grid(row=1, column=1, sticky="nsew")
         ws.rowconfigure(0, weight=3)
         ws.rowconfigure(1, weight=0)
         ws.rowconfigure(2, weight=1)
@@ -444,344 +460,386 @@ class DebrisTrackerGUI(tk.Tk):
         self._build_viewer(ws)
         self._build_log(ws)
 
-    def _build_viewer(self, parent):
-        nb = ttk.Notebook(parent, style="TNotebook")
-        nb.grid(row=0, column=0, sticky="nsew", pady=(0,1))
-        self._nb = nb
+    def _build_viewer(self, ws):
+        # Tab bar (manual — no ttk.Notebook for better dark styling)
+        tab_bar = tk.Frame(ws, bg=C["bg1"], height=36)
+        tab_bar.grid(row=0, column=0, sticky="new")
+        tab_bar.grid_propagate(False)
 
-        # Tab 1 — FITS viewer
-        t1 = tk.Frame(nb, bg=PAL["bg"])
-        nb.add(t1, text="  Image Viewer  ")
-        self._build_fits_tab(t1)
+        self._tab_frames = {}
+        self._tab_btns   = {}
 
-        # Tab 2 — Results table
-        t2 = tk.Frame(nb, bg=PAL["bg"])
-        nb.add(t2, text="  Detected Tracks  ")
-        self._build_results_tab(t2)
+        def _make_tab(name, label):
+            btn = tk.Button(tab_bar, text=label,
+                            bg=C["bg1"], fg=C["fg2"],
+                            activebackground=C["bg0"],
+                            activeforeground=C["blue"],
+                            font=F(9), relief="flat",
+                            cursor="hand2", padx=14, pady=6,
+                            bd=0, highlightthickness=0,
+                            command=lambda n=name: self._switch_tab(n))
+            btn.pack(side="left")
+            self._tab_btns[name] = btn
+
+        _make_tab("viewer",  "  Image Viewer")
+        _make_tab("results", "  Detected Tracks")
+        tk.Frame(tab_bar, bg=C["brd"], height=1).pack(side="bottom", fill="x")
+
+        # Content area
+        content = tk.Frame(ws, bg=C["bg0"])
+        content.grid(row=0, column=0, sticky="nsew", pady=(36,0))
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
+        ws.rowconfigure(0, weight=3)
+
+        # Viewer tab
+        vf = tk.Frame(content, bg=C["bg0"])
+        vf.grid(row=0, column=0, sticky="nsew")
+        self._tab_frames["viewer"] = vf
+        self._build_fits_tab(vf)
+
+        # Results tab
+        rf = tk.Frame(content, bg=C["bg0"])
+        self._tab_frames["results"] = rf
+        self._build_results_tab(rf)
+
+        self._switch_tab("viewer")
+
+    def _switch_tab(self, name):
+        for n, f in self._tab_frames.items():
+            f.grid_remove()
+        self._tab_frames[name].grid(row=0, column=0, sticky="nsew")
+        for n, btn in self._tab_btns.items():
+            active = (n == name)
+            btn.config(fg=C["blue"] if active else C["fg2"],
+                       bg=C["bg0"] if active else C["bg1"],
+                       font=F(9, "bold") if active else F(9))
 
     def _build_fits_tab(self, parent):
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
 
-        # Toolbar row
-        toolbar = tk.Frame(parent, bg=PAL["surface"], height=38)
-        toolbar.grid(row=0, column=0, sticky="ew")
-        toolbar.grid_propagate(False)
+        # Viewer toolbar
+        tbar = tk.Frame(parent, bg=C["bg1"], height=36)
+        tbar.grid(row=0, column=0, sticky="ew")
+        tbar.grid_propagate(False)
 
-        def _lbl(text):
-            return tk.Label(toolbar, text=text, bg=PAL["surface"],
-                            fg=PAL["fg_dim"], font=FONT_SMALL)
+        def _lbl(t): return tk.Label(tbar, text=t, bg=C["bg1"],
+                                      fg=C["fg2"], font=F(8))
 
-        _lbl("Stretch:").pack(side="left", padx=(12,4))
-        stretch_cb = ttk.Combobox(toolbar, textvariable=self.v_stretch,
-                                   values=["percentile","linear","log","sqrt"],
-                                   width=11, state="readonly", font=FONT_SMALL)
-        stretch_cb.pack(side="left", padx=(0,12))
-        stretch_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_display())
+        _lbl("Stretch").pack(side="left", padx=(10,3))
+        cb1 = _combo(tbar, self.v_stretch,
+                     ["percentile","linear","log","sqrt"], width=10)
+        cb1.pack(side="left", padx=(0,10))
+        cb1.bind("<<ComboboxSelected>>", lambda e: self._refresh())
 
-        _lbl("Colormap:").pack(side="left", padx=(0,4))
-        cmap_cb = ttk.Combobox(toolbar, textvariable=self.v_cmap,
-                                values=["gray","viridis","inferno","plasma","bone","hot"],
-                                width=11, state="readonly", font=FONT_SMALL)
-        cmap_cb.pack(side="left", padx=(0,12))
-        cmap_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_display())
+        _lbl("Colormap").pack(side="left", padx=(0,3))
+        cb2 = _combo(tbar, self.v_cmap,
+                     ["gray","viridis","inferno","plasma","bone","hot"], width=10)
+        cb2.pack(side="left", padx=(0,10))
+        cb2.bind("<<ComboboxSelected>>", lambda e: self._refresh())
 
-        ttk.Checkbutton(toolbar, text="Show annotated overlay",
-                        variable=self.v_show_ann,
-                        command=self._refresh_display).pack(side="left", padx=8)
+        # Annotated overlay toggle
+        ann_chk = ttk.Checkbutton(tbar, text="Annotated overlay",
+                                   variable=self.v_ann,
+                                   command=self._refresh)
+        ann_chk.pack(side="left", padx=(4,0))
 
-        # Coordinate readout — right-aligned
-        self._coord_lbl = tk.Label(toolbar, text="X: —  Y: —  |  RA: —  Dec: —",
-                                    bg=PAL["surface"], fg=PAL["amber"],
-                                    font=FONT_MONO)
-        self._coord_lbl.pack(side="right", padx=12)
+        # Coord readout — right side
+        self._coord = tk.Label(tbar,
+                                text="x: —   y: —   |   RA: —   Dec: —",
+                                bg=C["bg1"], fg=C["amber"],
+                                font=FM(8))
+        self._coord.pack(side="right", padx=12)
 
-        # Matplotlib figure — created ONCE, updated in place
-        fig_frame = tk.Frame(parent, bg=PAL["bg"])
-        fig_frame.grid(row=1, column=0, sticky="nsew")
+        tk.Frame(parent, bg=C["brd"], height=1).grid(
+            row=0, column=0, sticky="sew")
 
-        self._fig, self._ax = plt.subplots(figsize=(8, 6))
-        self._fig.patch.set_facecolor(PAL["bg"])
-        self._ax.set_facecolor(PAL["bg"])
-        self._ax.tick_params(colors=PAL["fg_dim"])
+        # Figure
+        fig_host = tk.Frame(parent, bg=C["bg0"])
+        fig_host.grid(row=1, column=0, sticky="nsew")
+        fig_host.rowconfigure(0, weight=1)
+        fig_host.columnconfigure(0, weight=1)
+
+        self._fig, self._ax = plt.subplots(figsize=(9,6))
+        self._fig.patch.set_facecolor(C["bg0"])
+        self._ax.set_facecolor(C["bg0"])
+        self._ax.tick_params(colors=C["fg2"], labelsize=7)
         for sp in self._ax.spines.values():
-            sp.set_color(PAL["border"])
+            sp.set_color(C["brd"])
         self._ax.set_xticks([]); self._ax.set_yticks([])
-        self._ax.set_title("No image loaded", color=PAL["fg_dim"],
-                            fontsize=10, pad=8)
-        self._im_artist = None    # matplotlib AxesImage, updated not recreated
+        self._ax.set_title("No image loaded",
+                            color=C["fg2"], fontsize=9, pad=6)
 
-        self._canvas = FigureCanvasTkAgg(self._fig, master=fig_frame)
-        self._canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._mpl_canvas = FigureCanvasTkAgg(self._fig, master=fig_host)
+        self._mpl_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
-        # Navigation toolbar — single loop, style fixed properly
-        tb_frame = tk.Frame(fig_frame, bg="#2a2a35")
-        tb_frame.pack(fill="x")
-        self._mpl_toolbar = NavigationToolbar2Tk(self._canvas, tb_frame)
-        self._mpl_toolbar.config(background="#2a2a35")
-        for ch in self._mpl_toolbar.winfo_children():
-            for key in ("background", "fg", "activebackground", "highlightbackground"):
-                try: ch.configure(**{key: "#2a2a35"})
-                except Exception: pass
-        self._mpl_toolbar.update()
+        # Nav toolbar
+        tb_host = tk.Frame(fig_host, bg=C["bg2"], height=28)
+        tb_host.grid(row=1, column=0, sticky="ew")
+        tb_host.grid_propagate(False)
+        self._mpl_tb = NavigationToolbar2Tk(self._mpl_canvas, tb_host)
+        self._mpl_tb.config(background=C["bg2"])
+        for ch in self._mpl_tb.winfo_children():
+            for k in ("background","activebackground",
+                       "highlightbackground","highlightcolor"):
+                try: ch.configure(**{k: C["bg2"]})
+                except: pass
+            for k in ("fg","foreground","activeforeground"):
+                try: ch.configure(**{k: C["fg1"]})
+                except: pass
+        self._mpl_tb.update()
 
-        # Mouse motion — debounced
         self._fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
 
     def _build_results_tab(self, parent):
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(0, weight=1)
 
+        # Header strip
+        hdr = tk.Frame(parent, bg=C["bg1"], height=36)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="Detected orbital streaks",
+                 bg=C["bg1"], fg=C["fg1"],
+                 font=F(9, "bold")).pack(side="left", padx=12, pady=8)
+        self._track_count = tk.Label(hdr, text="0 tracks",
+                                      bg=C["bg1"], fg=C["fg2"], font=F(8))
+        self._track_count.pack(side="right", padx=12)
+
+        tk.Frame(parent, bg=C["brd"], height=1).pack(fill="x")
+
         cols = ("id","label","mag","snr","net_flux","peak",
                 "length","ra","dec","start_px","end_px","sep")
-        headings = {
-            "id":       ("ID",              50),
-            "label":    ("Debris / Object", 200),
-            "mag":      ("Mag",             70),
-            "snr":      ("SNR",             70),
-            "net_flux": ("Net Flux",        90),
-            "peak":     ("Peak",            80),
-            "length":   ("Length (px)",     90),
-            "ra":       ("RA (deg)",        100),
-            "dec":      ("Dec (deg)",       100),
-            "start_px": ("Start (x,y)",    110),
-            "end_px":   ("End (x,y)",      110),
-            "sep":      ("Cat Sep (deg)",   110),
+        heads = {
+            "id":       ("ID",             50),
+            "label":    ("Object label",   200),
+            "mag":      ("Mag",            70),
+            "snr":      ("SNR",            70),
+            "net_flux": ("Net flux",       90),
+            "peak":     ("Peak",           80),
+            "length":   ("Length px",      90),
+            "ra":       ("RA deg",         100),
+            "dec":      ("Dec deg",        100),
+            "start_px": ("Start (x,y)",   110),
+            "end_px":   ("End (x,y)",     110),
+            "sep":      ("Cat sep deg",    110),
         }
 
-        frame = tk.Frame(parent, bg=PAL["bg"])
-        frame.pack(fill="both", expand=True)
+        tree_f = tk.Frame(parent, bg=C["bg0"])
+        tree_f.pack(fill="both", expand=True)
+        tree_f.rowconfigure(0, weight=1)
+        tree_f.columnconfigure(0, weight=1)
 
-        vsb = ttk.Scrollbar(frame, orient="vertical")
-        hsb = ttk.Scrollbar(frame, orient="horizontal")
-        self._tree = ttk.Treeview(frame, columns=cols, show="headings",
+        vsb = ttk.Scrollbar(tree_f, orient="vertical")
+        hsb = ttk.Scrollbar(tree_f, orient="horizontal")
+        self._tree = ttk.Treeview(tree_f, columns=cols,
+                                   show="headings",
                                    yscrollcommand=vsb.set,
                                    xscrollcommand=hsb.set,
                                    selectmode="browse")
         vsb.config(command=self._tree.yview)
         hsb.config(command=self._tree.xview)
-
         self._tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
 
-        for col, (title, width) in headings.items():
+        for col, (title, width) in heads.items():
             self._tree.heading(col, text=title,
-                               command=lambda c=col: self._sort_tree(c, False))
+                               command=lambda c=col: self._sort(c))
             self._tree.column(col, width=width, anchor="center", minwidth=40)
 
-        self._tree.tag_configure("match",   foreground=PAL["green"])
-        self._tree.tag_configure("nomatch", foreground=PAL["red"])
-        self._tree.bind("<Double-1>", self._on_row_dblclick)
+        self._tree.tag_configure("corr",  foreground=C["green"])
+        self._tree.tag_configure("nocorr",foreground=C["red"])
+        self._tree.bind("<Double-1>", self._row_dbl)
 
-    def _build_log(self, parent):
-        log_frame = tk.Frame(parent, bg=PAL["surface"], height=180)
-        log_frame.grid(row=2, column=0, sticky="ew")
-        log_frame.grid_propagate(False)
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(1, weight=1)
+    def _build_log(self, ws):
+        log_host = tk.Frame(ws, bg=C["bg1"])
+        log_host.grid(row=2, column=0, sticky="nsew")
+        log_host.rowconfigure(1, weight=1)
+        log_host.columnconfigure(0, weight=1)
+        ws.rowconfigure(2, weight=1)
 
-        hdr = tk.Frame(log_frame, bg=PAL["bg"], height=24)
-        hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
-        hdr.grid_propagate(False)
-        tk.Label(hdr, text="  Console output",
-                 bg=PAL["bg"], fg=PAL["accent"],
-                 font=FONT_UI_B, anchor="w").pack(side="left")
-        ttk.Button(hdr, text="Clear", style="Ghost.TButton",
-                   command=self._clear_log).pack(side="right", padx=4)
+        # Log header
+        lhdr = tk.Frame(log_host, bg=C["bg0"], height=28)
+        lhdr.grid(row=0, column=0, columnspan=2, sticky="ew")
+        lhdr.grid_propagate(False)
+        tk.Label(lhdr, text="  Console output",
+                 bg=C["bg0"], fg=C["blue"],
+                 font=F(9, "bold")).pack(side="left", pady=4)
+        _icon_btn(lhdr, "Clear", self._clear_log,
+                  bg=C["bg0"], fg=C["fg2"]).pack(side="right", padx=4)
 
-        vsb = ttk.Scrollbar(log_frame, orient="vertical")
+        tk.Frame(log_host, bg=C["brd"], height=1).grid(
+            row=0, column=0, sticky="sew", columnspan=2)
+
+        vsb = ttk.Scrollbar(log_host, orient="vertical")
         vsb.grid(row=1, column=1, sticky="ns")
 
-        self._log = tk.Text(log_frame,
-                             bg=PAL["bg"], fg="#44cc77",
-                             font=FONT_MONO, wrap="word",
+        self._log = tk.Text(log_host,
+                             bg=C["bg0"], fg=C["mono_fg"],
+                             font=FM(9), wrap="word",
                              yscrollcommand=vsb.set,
-                             padx=8, pady=4,
+                             padx=10, pady=6,
                              state="disabled",
-                             relief="flat")
+                             relief="flat", bd=0,
+                             height=8)
         self._log.grid(row=1, column=0, sticky="nsew")
         vsb.config(command=self._log.yview)
 
-        # Text tags for colour
-        self._log.tag_config("err",  foreground=PAL["red"])
-        self._log.tag_config("warn", foreground=PAL["amber"])
-        self._log.tag_config("info", foreground=PAL["accent"])
+        self._log.tag_config("err",  foreground=C["red"])
+        self._log.tag_config("warn", foreground=C["amber"])
+        self._log.tag_config("info", foreground=C["blue"])
 
     def _build_statusbar(self):
-        sb = tk.Frame(self, bg=PAL["bg"], height=26)
-        sb.grid(row=1, column=0, columnspan=2, sticky="ew")
-        sb.grid_propagate(False)
+        sbar = tk.Frame(self, bg=C["bg0"], height=24)
+        sbar.grid(row=2, column=0, columnspan=2, sticky="ew")
+        sbar.grid_propagate(False)
+        tk.Frame(sbar, bg=C["brd"], height=1).pack(side="top", fill="x")
 
-        self._spinner_lbl = tk.Label(sb, text="●", bg=PAL["bg"],
-                                      fg=PAL["fg_dim"],
-                                      font=(PAL["ui"], 10))
-        self._spinner_lbl.pack(side="left", padx=(10,4))
+        self._status_dot = tk.Label(sbar, text="●",
+                                     bg=C["bg0"], fg=C["fg2"],
+                                     font=F(9))
+        self._status_dot.pack(side="left", padx=(10,3))
+        tk.Label(sbar, textvariable=self.v_status,
+                 bg=C["bg0"], fg=C["fg2"],
+                 font=FM(8)).pack(side="left")
 
-        tk.Label(sb, textvariable=self.v_status,
-                 bg=PAL["bg"], fg=PAL["fg_dim"],
-                 font=FONT_SMALL).pack(side="left")
+        # Right: live frame count
+        self._frame_info = tk.Label(sbar, text="",
+                                     bg=C["bg0"], fg=C["fg2"],
+                                     font=FM(8))
+        self._frame_info.pack(side="right", padx=10)
 
-        # Shortcuts hint right side
-        tk.Label(sb, text="F5 Run  |  Ctrl+L Clear log  |  Esc Cancel",
-                 bg=PAL["bg"], fg=PAL["fg_dim"],
-                 font=FONT_SMALL).pack(side="right", padx=10)
-
-    # ── Image display (core performance path) ─────────────────────────────────
-    def _load_fits(self, path: Path):
-        """Read FITS into cache. Called from main thread only."""
+    # ── Image display (hot path — no figure recreation) ───────────────────────
+    def _load_fits(self, path):
         path = Path(path)
         try:
             with open(str(path), "rb") as f:
                 raw = f.read()
             with fits.open(io.BytesIO(raw), memmap=False) as h:
-                self._fits_data   = np.array(h[0].data, dtype=np.float32)
-                self._fits_header = h[0].header.copy()
-                try:
-                    self._fits_wcs = WCS(self._fits_header, relax=True)
-                except Exception:
-                    self._fits_wcs = None
-            self._fits_path     = path
-            self._display_cache = None
-            self._display_key   = None
+                self._fits_data = np.array(h[0].data, dtype=np.float32)
+                self._fits_hdr  = h[0].header.copy()
+                try:    self._fits_wcs = WCS(self._fits_hdr, relax=True)
+                except: self._fits_wcs = None
+            self._fits_path   = path
+            self._cache_arr   = None
+            self._cache_key   = None
             H, W = self._fits_data.shape
-            # Compute downsampling ONCE — target ~1200px on shortest axis
-            self._ds_factor = max(1, min(W, H) // 1200)
-            self._check_png_path()
-            self._refresh_display()
-            self._nb.select(0)
+            self._ds = max(1, min(W, H) // 1200)
+            self._check_png()
+            self._refresh()
+            self._switch_tab("viewer")
+            self._frame_info.config(
+                text=f"{path.name}  {W}×{H}  ds={self._ds}×")
         except Exception as e:
-            self._log_line(f"[ERROR] Failed to load {path.name}: {e}\n", "err")
+            self._log_write(f"[ERROR] Load {path.name}: {e}\n", "err")
 
-    def _check_png_path(self):
-        if not self._fits_path:
-            return
-        output = Path(self.v_output.get())
-        stem   = self._fits_path.stem.replace(" ", "_")
-        nf     = self.v_num_frames.get()
-        cand   = output / f"diff_{stem}_{nf}f_correlated.png"
+    def _check_png(self):
+        if not self._fits_path: return
+        out  = Path(self.v_out.get())
+        stem = self._fits_path.stem.replace(" ","_")
+        nf   = self.v_nf.get()
+        cand = out / f"diff_{stem}_{nf}f_correlated.png"
         self._png_path = cand if cand.exists() else None
 
-    def _refresh_display(self):
-        """Update the matplotlib axes IN PLACE — no figure recreation."""
-        if self._fits_data is None:
-            return
-
-        # Show annotated PNG if available and requested
-        if self.v_show_ann.get() and self._png_path and self._png_path.exists():
-            self._render_png(self._png_path)
-            return
+    def _refresh(self):
+        if self._fits_data is None: return
+        if self.v_ann.get() and self._png_path and self._png_path.exists():
+            self._show_png(self._png_path); return
 
         stretch = self.v_stretch.get()
         cmap    = self.v_cmap.get()
         key     = (stretch, cmap)
-
-        if key != self._display_key or self._display_cache is None:
-            ds   = self._fits_data[::self._ds_factor, ::self._ds_factor]
-            scaled = apply_stretch(ds, stretch_type=stretch)
-            self._display_cache = scaled
-            self._display_key   = key
+        if key != self._cache_key:
+            ds           = self._fits_data[::self._ds, ::self._ds]
+            self._cache_arr = apply_stretch(ds, stretch_type=stretch)
+            self._cache_key = key
 
         H, W = self._fits_data.shape
-
-        if self._im_artist is None:
-            self._im_artist = self._ax.imshow(
-                self._display_cache, cmap=cmap, origin="lower",
-                extent=[0, W, 0, H], aspect="auto")
+        if self._im is None:
+            self._im = self._ax.imshow(
+                self._cache_arr, cmap=cmap, origin="lower",
+                extent=[0,W,0,H], aspect="auto",
+                interpolation="nearest")
         else:
-            self._im_artist.set_data(self._display_cache)
-            self._im_artist.set_cmap(cmap)
-            self._im_artist.set_extent([0, W, 0, H])
+            self._im.set_data(self._cache_arr)
+            self._im.set_cmap(cmap)
+            self._im.set_extent([0,W,0,H])
 
-        self._ax.set_title(self._fits_path.name if self._fits_path else "",
-                            color=PAL["fg"], fontsize=9, pad=4)
-        self._draw_track_overlays()
-        self._canvas.draw_idle()
+        self._ax.set_title(
+            self._fits_path.name if self._fits_path else "",
+            color=C["fg1"], fontsize=8, pad=4)
+        self._draw_overlays()
+        self._mpl_canvas.draw_idle()
 
-    def _render_png(self, png_path: Path):
-        """Render an annotated PNG into the axes without recreating the figure."""
+    def _show_png(self, p):
         try:
-            img = mpimg.imread(str(png_path))
+            img = mpimg.imread(str(p))
             ih, iw = img.shape[:2]
-            H = self._fits_data.shape[0] if self._fits_data is not None else ih
             W = self._fits_data.shape[1] if self._fits_data is not None else iw
-
-            if self._im_artist is None:
-                self._im_artist = self._ax.imshow(
-                    img, origin="upper", extent=[0, W, 0, H], aspect="auto")
+            H = self._fits_data.shape[0] if self._fits_data is not None else ih
+            if self._im is None:
+                self._im = self._ax.imshow(
+                    img, origin="upper", extent=[0,W,0,H], aspect="auto")
             else:
-                self._im_artist.set_data(img)
-                self._im_artist.set_extent([0, W, 0, H])
-
-            self._ax.set_title(png_path.name, color=PAL["amber"],
-                                fontsize=9, pad=4)
-            self._canvas.draw_idle()
+                self._im.set_data(img)
+                self._im.set_extent([0,W,0,H])
+            self._ax.set_title(p.name, color=C["amber"], fontsize=8, pad=4)
+            self._mpl_canvas.draw_idle()
         except Exception as e:
-            self._log_line(f"[WARN] Could not render PNG: {e}\n", "warn")
+            self._log_write(f"[WARN] PNG render: {e}\n", "warn")
 
-    def _draw_track_overlays(self):
-        """Draw streak overlays. Called only from _refresh_display."""
-        # Remove previous overlays (lines, patches, texts added by us)
-        for artist in list(self._ax.lines + self._ax.patches +
-                           self._ax.texts):
+    def _draw_overlays(self):
+        for artist in (self._ax.lines + self._ax.patches + self._ax.texts):
             try: artist.remove()
-            except Exception: pass
-
+            except: pass
         for t in self._tracks:
-            p1    = t.get("start_pixel", [0, 0])
-            p2    = t.get("end_pixel",   [0, 0])
-            color = PAL["green"] if t.get("is_match") else PAL["red"]
-            self._ax.plot([p1[0],p2[0]], [p1[1],p2[1]],
-                          color=PAL["amber"], lw=1.2, ls="--")
-            self._ax.scatter([p1[0],p2[0]], [p1[1],p2[1]],
-                             color=color, s=18, zorder=5)
-            xlo = min(p1[0],p2[0])-12
-            ylo = min(p1[1],p2[1])-12
-            xhi = max(p1[0],p2[0])+12
-            yhi = max(p1[1],p2[1])+12
-            rect = plt.Rectangle((xlo,ylo), xhi-xlo, yhi-ylo,
-                                  fill=False, edgecolor=color, lw=1.2)
+            p1    = t.get("start_pixel",[0,0])
+            p2    = t.get("end_pixel",  [0,0])
+            color = C["green"] if t.get("is_match") else C["red"]
+            self._ax.plot([p1[0],p2[0]],[p1[1],p2[1]],
+                          color=C["amber"], lw=1.1, ls="--", alpha=.8)
+            self._ax.scatter([p1[0],p2[0]],[p1[1],p2[1]],
+                             color=color, s=16, zorder=5)
+            xlo = min(p1[0],p2[0])-14; ylo = min(p1[1],p2[1])-14
+            xhi = max(p1[0],p2[0])+14; yhi = max(p1[1],p2[1])+14
+            rect = plt.Rectangle((xlo,ylo),xhi-xlo,yhi-ylo,
+                                  fill=False,edgecolor=color,lw=1.1,alpha=.8)
             self._ax.add_patch(rect)
-            self._ax.text(xlo, yhi+3,
-                          f"T{t['track_id']}: {t['label']}",
-                          color=color, fontsize=7, fontweight="bold")
+            self._ax.text(xlo, yhi+3, f"T{t['track_id']}: {t['label']}",
+                          color=color, fontsize=6.5, fontweight="bold")
 
-    # ── Mouse motion — debounced to ~60fps ───────────────────────────────────
+    # ── Debounced mouse coords ────────────────────────────────────────────────
     def _on_motion(self, event):
-        if self._motion_after:
-            self.after_cancel(self._motion_after)
-        self._motion_after = self.after(16, lambda: self._update_coords(event))
+        if self._motion_id:
+            self.after_cancel(self._motion_id)
+        self._motion_id = self.after(16, lambda: self._update_coord(event))
 
-    def _update_coords(self, event):
-        self._motion_after = None
-        if event.inaxes is None or self._fits_data is None:
-            return
+    def _update_coord(self, event):
+        self._motion_id = None
+        if event.inaxes is None or self._fits_data is None: return
         x, y = event.xdata, event.ydata
         ra_s = dec_s = "—"
         if self._fits_wcs and self._fits_wcs.has_celestial:
             try:
                 ra, dec = self._fits_wcs.pixel_to_world_values(x, y)
-                ra_s  = f"{ra:.5f}°"
-                dec_s = f"{dec:+.5f}°"
-            except Exception:
-                pass
+                ra_s  = f"{ra:.5f}"
+                dec_s = f"{dec:+.5f}"
+            except: pass
         try:
             val = self._fits_data[int(round(y)), int(round(x))]
-            val_s = f"{val:.1f}"
-        except Exception:
-            val_s = "—"
-        self._coord_lbl.config(
-            text=f"X: {x:.1f}  Y: {y:.1f}  [{val_s}]  |  RA: {ra_s}  Dec: {dec_s}")
+            vs  = f"{val:.1f}"
+        except: vs = "—"
+        self._coord.config(
+            text=f"x: {x:.1f}   y: {y:.1f}   [{vs}]   |   RA: {ra_s}   Dec: {dec_s}")
 
     # ── Logging ───────────────────────────────────────────────────────────────
-    def _log_line(self, text: str, tag: str = ""):
+    def _log_write(self, text, tag=""):
         self._log.config(state="normal")
-        # Trim if over limit
-        lines = int(self._log.index("end-1c").split(".")[0])
-        if lines > _Logger.MAX_LINES:
-            self._log.delete("1.0", f"{lines - _Logger.MAX_LINES // 2}.0")
+        end = int(self._log.index("end-1c").split(".")[0])
+        if end > LOG_MAX:
+            self._log.delete("1.0", f"{end - LOG_MAX//2}.0")
         if tag:
             self._log.insert("end", text, tag)
         else:
@@ -789,308 +847,291 @@ class DebrisTrackerGUI(tk.Tk):
         self._log.see("end")
         self._log.config(state="disabled")
 
-    def _drain_log_q(self):
+    def _poll_log(self):
         try:
-            budget = 50  # process at most 50 chunks per tick
-            while budget > 0:
+            n = 0
+            while n < 60:
                 kind, payload = self._log_q.get_nowait()
                 if kind == "log":
                     tag = ("err"  if "[ERROR]" in payload else
                            "warn" if "[WARN]"  in payload else
                            "info" if "[INFO]"  in payload else "")
-                    self._log_line(payload, tag)
-                budget -= 1
+                    self._log_write(payload, tag)
+                n += 1
         except queue.Empty:
             pass
-        self.after(80, self._drain_log_q)
+        self.after(80, self._poll_log)
 
-    def _drain_gui_q(self):
+    def _poll_gui(self):
         try:
             while True:
                 fn = self._gui_q.get_nowait()
                 try: fn()
                 except Exception as e:
-                    self._log_line(f"[ERROR] GUI task: {e}\n", "err")
+                    self._log_write(f"[ERROR] GUI: {e}\n", "err")
         except queue.Empty:
             pass
-        self.after(50, self._drain_gui_q)
+        self.after(50, self._poll_gui)
 
     def _safe(self, fn, *a, **kw):
-        """Queue a callable to run on the main thread."""
         self._gui_q.put(lambda: fn(*a, **kw))
 
     def _clear_log(self):
         self._log.config(state="normal")
-        self._log.delete("1.0", "end")
+        self._log.delete("1.0","end")
         self._log.config(state="disabled")
 
-    # ── Status bar spinner ────────────────────────────────────────────────────
+    # ── Telemetry + spinner ───────────────────────────────────────────────────
     _SPIN = ["◐","◓","◑","◒"]
 
-    def _start_spinner(self, msg="Running…"):
+    def _start_telem(self, msg="RUNNING"):
         self.v_status.set(msg)
-        self._spinner_idx = 0
-        self._tick_spinner()
+        self._status_dot.config(fg=C["amber"])
+        self._telem_lbl.config(text=f"● {msg}")
+        self._telem_frame.config(bg=C["amber_dim"])
+        self._telem_lbl.config(bg=C["amber_dim"])
+        self._spin_i = 0
+        self._tick_spin()
 
-    def _tick_spinner(self):
-        self._spinner_lbl.config(
-            fg=PAL["amber"],
-            text=self._SPIN[self._spinner_idx % len(self._SPIN)])
-        self._spinner_idx += 1
-        self._spinner_after = self.after(200, self._tick_spinner)
+    def _tick_spin(self):
+        ch = self._SPIN[self._spin_i % len(self._SPIN)]
+        self._telem_lbl.config(
+            text=f"{ch} {self.v_status.get()}")
+        self._spin_i += 1
+        self._spin_id = self.after(220, self._tick_spin)
 
-    def _stop_spinner(self, msg="Ready"):
-        if self._spinner_after:
-            self.after_cancel(self._spinner_after)
-            self._spinner_after = None
+    def _stop_telem(self, msg="IDLE"):
+        if self._spin_id:
+            self.after_cancel(self._spin_id)
+            self._spin_id = None
         self.v_status.set(msg)
-        self._spinner_lbl.config(fg=PAL["fg_dim"], text="●")
+        self._status_dot.config(fg=C["fg2"])
+        self._telem_lbl.config(text=f"● {msg}",
+                                fg=C["amber"], bg=C["amber_dim"])
 
-    # ── Browse helpers ────────────────────────────────────────────────────────
+    # ── Browse ────────────────────────────────────────────────────────────────
     def _browse_raw(self):
-        p = filedialog.askdirectory(title="Select Raw FITS folder",
-                                     initialdir=self.v_raw_dir.get())
-        if p:
-            self.v_raw_dir.set(p); self._scan_raw_dir()
+        p = filedialog.askdirectory(
+            title="Select raw FITS folder", initialdir=self.v_raw.get())
+        if p: self.v_raw.set(p); self._scan_fits()
 
-    def _browse_catalog(self):
+    def _browse_cat(self):
         p = filedialog.askopenfilename(
             title="Select TLE catalogue",
             filetypes=[("Text","*.txt"),("All","*.*")],
-            initialdir=str(Path(self.v_catalog.get()).parent))
-        if p: self.v_catalog.set(p)
+            initialdir=str(Path(self.v_cat.get()).parent))
+        if p: self.v_cat.set(p)
 
-    def _browse_output(self):
-        p = filedialog.askdirectory(title="Select output directory",
-                                     initialdir=self.v_output.get())
-        if p: self.v_output.set(p)
+    def _browse_out(self):
+        p = filedialog.askdirectory(
+            title="Select output folder", initialdir=self.v_out.get())
+        if p: self.v_out.set(p)
 
-    def _scan_raw_dir(self):
+    def _scan_fits(self):
         try:
-            files = get_sorted_fits(Path(self.v_raw_dir.get()))
+            files = get_sorted_fits(Path(self.v_raw.get()))
             names = [f.name for f in files]
-            self._frame_combo.config(values=names)
-            if names and self.v_start_frame.get() not in names:
-                self.v_start_frame.set(names[0])
+            self._frame_cb.config(values=names)
+            if names and self.v_frame.get() not in names:
+                self.v_frame.set(names[0])
+            self._frame_info.config(text=f"{len(names)} FITS files found")
         except Exception as e:
-            self._log_line(f"[WARN] Could not scan FITS directory: {e}\n", "warn")
+            self._log_write(f"[WARN] Scan: {e}\n","warn")
 
-    def _on_frame_selected(self, _event=None):
-        path = Path(self.v_raw_dir.get()) / self.v_start_frame.get()
+    def _on_frame(self, _e=None):
+        path = Path(self.v_raw.get()) / self.v_frame.get()
         if path.exists():
             self._load_fits(path)
 
-    # ── Tree helpers ──────────────────────────────────────────────────────────
+    # ── Tree ──────────────────────────────────────────────────────────────────
     def _populate_tree(self, results):
         for item in self._tree.get_children():
             self._tree.delete(item)
         for res in results:
             ph  = res["photometry"]
-            mag = f"{ph['magnitude']:.2f}" if not math.isnan(ph["magnitude"]) else "N/A"
-            p1  = res["start_pixel"]
-            p2  = res["end_pixel"]
-            tag = "match" if res.get("is_match") else "nomatch"
-            self._tree.insert("", "end", tags=(tag,), values=(
-                res["track_id"],
-                res["label"],
-                mag,
-                f"{ph['snr']:.1f}",
-                f"{ph['net_flux']:.1f}",
-                f"{ph['peak_value']:.1f}",
+            mag = (f"{ph['magnitude']:.2f}"
+                   if not math.isnan(ph["magnitude"]) else "N/A")
+            p1, p2 = res["start_pixel"], res["end_pixel"]
+            tag = "corr" if res.get("is_match") else "nocorr"
+            self._tree.insert("","end", tags=(tag,), values=(
+                res["track_id"],   res["label"],
+                mag,               f"{ph['snr']:.1f}",
+                f"{ph['net_flux']:.1f}", f"{ph['peak_value']:.1f}",
                 f"{ph['streak_length']:.1f}",
-                f"{res['centroid_ra']:.4f}",
-                f"{res['centroid_dec']:.4f}",
+                f"{res['centroid_ra']:.4f}", f"{res['centroid_dec']:.4f}",
                 f"({p1[0]:.1f},{p1[1]:.1f})",
                 f"({p2[0]:.1f},{p2[1]:.1f})",
                 f"{res['separation_deg']:.4f}",
             ))
+        n = len(results)
+        nc = sum(1 for r in results if r.get("is_match"))
+        self._track_count.config(
+            text=f"{n} track{'s' if n!=1 else ''}  ·  {nc} correlated")
 
-    _sort_reverse = {}
-
-    def _sort_tree(self, col, reverse):
-        data = [(self._tree.set(k, col), k)
+    _sort_asc = {}
+    def _sort(self, col):
+        asc = not self._sort_asc.get(col, False)
+        self._sort_asc[col] = asc
+        data = [(self._tree.set(k,col),k)
                 for k in self._tree.get_children("")]
-        try:
-            data.sort(key=lambda t: float(t[0].replace("N/A","inf")),
-                      reverse=reverse)
-        except Exception:
-            data.sort(reverse=reverse)
-        for idx, (_, k) in enumerate(data):
-            self._tree.move(k, "", idx)
-        self._tree.heading(col,
-            command=lambda c=col, r=not reverse: self._sort_tree(c, r))
+        try:    data.sort(key=lambda t: float(t[0].replace("N/A","inf")),
+                          reverse=not asc)
+        except: data.sort(reverse=not asc)
+        for i,(_,k) in enumerate(data): self._tree.move(k,"",i)
 
-    def _on_row_dblclick(self, _event=None):
+    def _row_dbl(self, _e=None):
         sel = self._tree.selection()
         if not sel: return
-        tid = int(self._tree.item(sel[0], "values")[0])
-        track = next((t for t in self._tracks if t["track_id"] == tid), None)
-        if not track: return
-        p1, p2 = track["start_pixel"], track["end_pixel"]
-        mx, my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
-        hw = 120
+        tid = int(self._tree.item(sel[0],"values")[0])
+        t   = next((x for x in self._tracks if x["track_id"]==tid), None)
+        if not t: return
+        p1,p2 = t["start_pixel"], t["end_pixel"]
+        mx,my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
+        hw = 100
         self._ax.set_xlim(mx-hw, mx+hw)
         self._ax.set_ylim(my-hw, my+hw)
-        self._canvas.draw_idle()
-        self._nb.select(0)
+        self._mpl_canvas.draw_idle()
+        self._switch_tab("viewer")
 
-    # ── Pipeline trigger ──────────────────────────────────────────────────────
-    def _trigger(self, stage: str):
+    # ── Pipeline control ──────────────────────────────────────────────────────
+    def _run(self, stage):
         if self._running:
-            self._log_line("[WARN] A pipeline step is already running.\n", "warn")
-            return
-        self._cancel_flag.clear()
-        self._set_running(True)
+            print("[WARN] A stage is already running.\n"); return
+        self._cancel.clear()
+        self._set_busy(True)
+        self._start_telem(stage.upper())
+        workers = dict(
+            preprocess=self._w_preprocess,
+            diff=self._w_diff, solve=self._w_solve,
+            correlate=self._w_correlate, full=self._w_full)
+        t = threading.Thread(target=workers.get(stage,lambda:None), daemon=True)
+        t.start()
 
-        workers = {
-            "preprocess": self._worker_preprocess,
-            "diff":       self._worker_diff,
-            "solve":      self._worker_solve,
-            "correlate":  self._worker_correlate,
-            "full":       self._worker_full,
-        }
-        fn = workers.get(stage)
-        if not fn:
-            self._set_running(False); return
-
-        self._start_spinner(f"{stage.title()} running…")
-        threading.Thread(target=fn, daemon=True).start()
-
-    def _cancel(self):
+    def _do_cancel(self):
         if self._running:
-            self._cancel_flag.set()
-            self._log_line("[INFO] Cancel requested — will stop after current step.\n", "info")
+            self._cancel.set()
+            print("[INFO] Cancelling after current step…\n")
 
-    def _set_running(self, state: bool):
-        self._running = state
-        st = "disabled" if state else "normal"
-        self._run_btn.config(state=st)
-        self._cancel_btn.config(state="normal" if state else "disabled")
+    def _set_busy(self, busy):
+        self._running = busy
+        self._run_btn.config(state="disabled" if busy else "normal")
+        self._cancel_btn.config(state="normal" if busy else "disabled")
 
-    def _done(self, msg="Ready"):
-        self._safe(self._stop_spinner, msg)
-        self._safe(self._set_running, False)
+    def _done(self, msg="IDLE"):
+        self._safe(self._stop_telem, msg)
+        self._safe(self._set_busy, False)
 
     # ── Workers ───────────────────────────────────────────────────────────────
-    def _worker_preprocess(self):
+    def _w_preprocess(self):
         try:
-            run_preprocessing(Path(self.v_raw_dir.get()),
-                               Path(self.v_output.get()),
-                               num_adj=2, batch_size=40)
-            self._done("Pre-processing complete")
+            run_preprocessing(Path(self.v_raw.get()),
+                               Path(self.v_out.get()), num_adj=2, batch_size=40)
+            self._done("PREPROCESS DONE")
         except Exception as e:
-            self._log_line(f"[ERROR] Preprocessing: {e}\n", "err")
-            self._done("Pre-processing failed")
+            print(f"[ERROR] Preprocess: {e}\n")
+            self._done("PREPROCESS FAILED")
 
-    def _worker_diff(self):
+    def _w_diff(self):
         try:
-            diff, header, fits_out, png_out = run_difference(
-                Path(self.v_raw_dir.get()),
-                self.v_start_frame.get(),
-                self.v_num_frames.get(),
-                Path(self.v_output.get()))
+            _,_,fits_out,_ = run_difference(
+                Path(self.v_raw.get()), self.v_frame.get(),
+                self.v_nf.get(), Path(self.v_out.get()))
             self._safe(self._load_fits, fits_out)
-            self._done("Difference image ready")
+            self._done("DIFFERENCE DONE")
         except Exception as e:
-            self._log_line(f"[ERROR] Differencing: {e}\n", "err")
-            self._done("Differencing failed")
+            print(f"[ERROR] Difference: {e}\n")
+            self._done("DIFFERENCE FAILED")
 
-    def _worker_solve(self):
+    def _w_solve(self):
         try:
-            fits_dir   = Path(self.v_raw_dir.get())
-            raw_path   = fits_dir / self.v_start_frame.get()
-            stem       = Path(self.v_start_frame.get()).stem.replace(" ","_")
-            nf         = self.v_num_frames.get()
-            diff_path  = Path(self.v_output.get()) / f"diff_{stem}_{nf}f.fits"
-            ok = solve_and_apply_wcs(str(raw_path), str(diff_path))
-            msg = "Plate solve complete" if ok else "Plate solve: no solution found"
-            if ok: self._safe(self._load_fits, diff_path)
-            self._done(msg)
+            stem   = Path(self.v_frame.get()).stem.replace(" ","_")
+            nf     = self.v_nf.get()
+            df     = Path(self.v_out.get()) / f"diff_{stem}_{nf}f.fits"
+            raw    = Path(self.v_raw.get()) / self.v_frame.get()
+            ok     = solve_and_apply_wcs(str(raw), str(df))
+            if ok: self._safe(self._load_fits, df)
+            self._done("SOLVE DONE" if ok else "SOLVE: NO SOLUTION")
         except Exception as e:
-            self._log_line(f"[ERROR] Solve: {e}\n", "err")
-            self._done("Plate solve failed")
+            print(f"[ERROR] Solve: {e}\n")
+            self._done("SOLVE FAILED")
 
-    def _worker_correlate(self):
+    def _w_correlate(self):
         try:
-            stem   = Path(self.v_start_frame.get()).stem.replace(" ","_")
-            nf     = self.v_num_frames.get()
-            out    = Path(self.v_output.get())
-            df     = out / f"diff_{stem}_{nf}f.fits"
-            png_out= out / f"diff_{stem}_{nf}f_correlated.png"
-            cat    = Path(self.v_catalog.get())
+            stem    = Path(self.v_frame.get()).stem.replace(" ","_")
+            nf      = self.v_nf.get()
+            out     = Path(self.v_out.get())
+            df      = out / f"diff_{stem}_{nf}f.fits"
+            png_out = out / f"diff_{stem}_{nf}f_correlated.png"
+            results = process_and_correlate(
+                str(df), str(self.v_cat.get()), str(png_out))
+            self._tracks = results or []
+            self._safe(self._populate_tree, self._tracks)
+            if png_out.exists():
+                self._png_path = png_out
+                self._safe(self._show_png, png_out)
+            self._done(f"CORRELATED — {len(self._tracks)} TRACKS")
+        except Exception as e:
+            print(f"[ERROR] Correlate: {e}\n")
+            self._done("CORRELATE FAILED")
+
+    def _w_full(self):
+        try:
+            raw  = Path(self.v_raw.get())
+            out  = Path(self.v_out.get())
+            cat  = Path(self.v_cat.get())
+            sf   = self.v_frame.get()
+            nf   = self.v_nf.get()
+            stem = Path(sf).stem.replace(" ","_")
+
+            if not sf:
+                print("[ERROR] No start frame selected.\n"); self._done(); return
+
+            print("="*55 + "\n  FRIGATE — Full pipeline\n" + "="*55 + "\n")
+
+            if self.v_preproc.get() and not self._cancel.is_set():
+                print("[1/4] Pre-processing…\n")
+                self._safe(self._start_telem, "PRE-PROCESS")
+                run_preprocessing(raw, out, num_adj=2, batch_size=40)
+
+            if self._cancel.is_set(): self._done("CANCELLED"); return
+            print("[2/4] Differencing…\n")
+            self._safe(self._start_telem, "DIFFERENCE")
+            _,_,df,_ = run_difference(raw, sf, nf, out)
+            self._safe(self._load_fits, df)
+
+            if self.v_solve.get() and not self._cancel.is_set():
+                print("[3/4] Plate solving…\n")
+                self._safe(self._start_telem, "PLATE SOLVE")
+                solve_and_apply_wcs(str(raw/sf), str(df))
+                self._safe(self._load_fits, df)
+
+            if self._cancel.is_set(): self._done("CANCELLED"); return
+            print("[4/4] Detecting & correlating…\n")
+            self._safe(self._start_telem, "CORRELATE")
+            png_out = out / f"diff_{stem}_{nf}f_correlated.png"
             results = process_and_correlate(str(df), str(cat), str(png_out))
             self._tracks = results or []
             self._safe(self._populate_tree, self._tracks)
             if png_out.exists():
                 self._png_path = png_out
-                self._safe(self._render_png, png_out)
-            msg = f"Detected {len(self._tracks)} track(s)"
-            self._done(msg)
+                self._safe(self._show_png, png_out)
+
+            n = len(self._tracks)
+            print(f"\n[DONE]  {n} track{'s' if n!=1 else ''} detected.\n")
+            self._done(f"COMPLETE — {n} TRACKS")
         except Exception as e:
-            self._log_line(f"[ERROR] Correlation: {e}\n", "err")
-            self._done("Correlation failed")
-
-    def _worker_full(self):
-        try:
-            fits_dir = Path(self.v_raw_dir.get())
-            out      = Path(self.v_output.get())
-            cat      = Path(self.v_catalog.get())
-            sf       = self.v_start_frame.get()
-            nf       = self.v_num_frames.get()
-            stem     = Path(sf).stem.replace(" ", "_")
-
-            if not sf:
-                self._log_line("[ERROR] No start frame selected.\n", "err")
-                self._done("Failed — no start frame"); return
-
-            print("=" * 55)
-            print("  FRIGATE Full Pipeline")
-            print("=" * 55)
-
-            # Step 1
-            if self.v_do_preproc.get() and not self._cancel_flag.is_set():
-                print("\n[1/4] Pre-processing frames…")
-                run_preprocessing(fits_dir, out, num_adj=2, batch_size=40)
-
-            # Step 2
-            if self._cancel_flag.is_set(): self._done("Cancelled"); return
-            print("\n[2/4] Computing difference image…")
-            diff, header, diff_fits, _ = run_difference(fits_dir, sf, nf, out)
-            self._safe(self._load_fits, diff_fits)
-
-            # Step 3
-            if self.v_do_solve.get() and not self._cancel_flag.is_set():
-                print("\n[3/4] Plate solving…")
-                solve_and_apply_wcs(str(fits_dir / sf), str(diff_fits))
-                self._safe(self._load_fits, diff_fits)
-
-            # Step 4
-            if self._cancel_flag.is_set(): self._done("Cancelled"); return
-            print("\n[4/4] Detecting tracks & correlating…")
-            png_out = out / f"diff_{stem}_{nf}f_correlated.png"
-            results = process_and_correlate(str(diff_fits), str(cat), str(png_out))
-            self._tracks = results or []
-            self._safe(self._populate_tree, self._tracks)
-            if png_out.exists():
-                self._png_path = png_out
-                self._safe(self._render_png, png_out)
-
-            print(f"\n[DONE] {len(self._tracks)} track(s) detected.")
-            self._done(f"Complete — {len(self._tracks)} track(s) found")
-
-        except Exception as e:
-            self._log_line(f"[ERROR] Full pipeline: {e}\n", "err")
-            self._done("Pipeline failed")
+            print(f"[ERROR] Full pipeline: {e}\n")
+            self._done("PIPELINE FAILED")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     def destroy(self):
-        sys.stdout = self._orig_stdout
-        sys.stderr = self._orig_stderr
+        sys.stdout = self._out0
+        sys.stderr = self._err0
         plt.close("all")
         super().destroy()
 
 
 # =============================================================================
 if __name__ == "__main__":
-    app = DebrisTrackerGUI()
+    app = FrigateGUI()
     app.mainloop()
